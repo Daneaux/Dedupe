@@ -5,12 +5,17 @@ A macOS desktop application for finding and managing exact duplicate images with
 ## Features
 
 - **Exact Duplicate Detection**: Uses MD5 file hashing to find byte-for-byte identical files
-- **Intra-Directory Focus**: Processes each directory separately to find duplicates within the same folder
+- **Two Scan Modes**:
+  - **Intra-Directory**: Find duplicates within the same folder
+  - **Date Folder Merge**: Find duplicates across related date-prefixed folders (e.g., `01-18` and `01-18 Grace`)
 - **Extension-Aware**: Only compares files of the same type (JPG vs JPG, not JPG vs RAW)
-- **Smart Keep Suggestions**: Automatically suggests keeping the larger file
+- **Smart Keep Suggestions**:
+  - Intra-directory mode: Keeps the larger file
+  - Merge mode: Keeps the file with the shortest filename
 - **Real-Time Progress**: Shows progress as each directory is processed with incremental results
 - **Finder Integration**: Right-click to open files in Finder or view with default app
 - **Batch Operations**: Move duplicates to a separate folder or delete them
+- **Folder Merge**: Automatically merge date folders and clean up empty directories
 - **CSV Export**: Export results for external analysis
 
 ## Supported File Types
@@ -65,15 +70,38 @@ python src/main.py
 ### Workflow
 
 1. **Select Directory**: Click "Browse" to choose a root directory to scan
-2. **Scan**: Click "Scan for Duplicates" to begin the analysis
-3. **Review Results**: Duplicates are grouped and displayed with:
+2. **Choose Mode**:
+   - **Intra-Directory**: Find duplicates within the same folder
+   - **Date Folder Merge**: For year folders like `2004/`, finds duplicates across folders with the same date prefix (e.g., `01-18` and `01-18 Grace`)
+3. **Scan**: Click "Scan for Duplicates" to begin the analysis
+4. **Review Results**: Duplicates are grouped and displayed with:
    - File name, size, resolution, and path
-   - Suggested action (KEEP or DELETE) based on file size
-4. **Adjust Selections**: Check/uncheck files to customize which to keep
-5. **Take Action**:
-   - **Move Selected**: Moves checked files to a `_duplicates` folder alongside the originals
+   - Suggested action (KEEP or DELETE)
+   - Target folder for merge mode (shown as `[→ FolderName]`)
+5. **Adjust Selections**: Check/uncheck files to customize which to keep
+6. **Take Action**:
+   - **Move Selected**: Moves checked files to a `_duplicates` folder (intra-directory mode)
+   - **Merge Folders**: Deletes duplicates and optionally removes empty source folders (merge mode)
    - **Delete Selected**: Permanently deletes checked files
    - **Export CSV**: Saves results to a CSV file
+
+### Date Folder Merge Mode
+
+This mode is designed for photo libraries organized by date, where you might have:
+```
+2004/
+├── 01-18/           # Original folder with photos
+├── 01-18 Grace/     # Same day, different event name
+├── 03-22/
+└── 03-22 Birthday/
+```
+
+The merge mode will:
+1. Find folders with the same date prefix (e.g., `01-18` matches `01-18 Grace`)
+2. Scan both folders for exact duplicates
+3. Keep the file with the **shortest filename** (typically the cleaner name)
+4. Mark other duplicates for deletion
+5. Offer to remove empty folders after merging
 
 ### Context Menu
 

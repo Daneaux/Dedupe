@@ -4,7 +4,7 @@ import pytest
 from pathlib import Path
 
 from src.core.scanner import ImageScanner
-from src.core.deduplicator import Deduplicator
+from src.core.deduplicator import Deduplicator, compute_perceptual_hash
 from src.models.duplicate_group import DuplicateGroup
 
 
@@ -143,3 +143,116 @@ class TestDeduplicator:
 
         # Should return partial or empty results
         assert isinstance(groups, list)
+
+
+class TestPerceptualHash:
+    """Test cases for perceptual hashing functionality."""
+
+    def test_perceptual_hash_returns_valid_hash(self, temp_dir):
+        """Test that perceptual hash returns a valid hash for image files."""
+        from PIL import Image
+
+        # Create a simple test image
+        img = Image.new('RGB', (400, 300), (100, 150, 200))
+        path = temp_dir / "test.jpg"
+        img.save(path, quality=95)
+
+        hash_result = compute_perceptual_hash(str(path))
+
+        assert hash_result is not None, "Failed to compute perceptual hash"
+        # Hash should be comparable (can subtract from another hash)
+        assert hasattr(hash_result, '__sub__'), "Hash should support subtraction"
+
+    def test_perceptual_hash_same_image_identical(self, temp_dir):
+        """Test that the same image saved twice has identical hash."""
+        from PIL import Image
+
+        img = Image.new('RGB', (400, 300), (100, 150, 200))
+        path1 = temp_dir / "image1.jpg"
+        path2 = temp_dir / "image2.jpg"
+        img.save(path1, quality=95)
+        img.save(path2, quality=95)
+
+        hash1 = compute_perceptual_hash(str(path1))
+        hash2 = compute_perceptual_hash(str(path2))
+
+        assert hash1 is not None
+        assert hash2 is not None
+        assert hash1 - hash2 == 0, "Identical images should have identical hashes"
+
+    def test_perceptual_hash_handles_various_formats(self, temp_dir):
+        """Test that perceptual hash works with different image formats."""
+        from PIL import Image
+
+        img = Image.new('RGB', (400, 300), (100, 150, 200))
+
+        # Test various formats
+        for ext in ['jpg', 'png', 'bmp']:
+            path = temp_dir / f"test.{ext}"
+            img.save(path)
+            hash_result = compute_perceptual_hash(str(path))
+            assert hash_result is not None, f"Failed for format {ext}"
+
+    def test_perceptual_hash_different_images(self, temp_dir):
+        """Test that perceptual hash correctly distinguishes different images."""
+        from PIL import Image
+
+        # Create two distinctly different images
+        img1 = Image.new('RGB', (400, 300), (255, 0, 0))  # Red
+        img2 = Image.new('RGB', (400, 300), (0, 0, 255))  # Blue
+
+        # Add different patterns
+        pixels1 = img1.load()
+        pixels2 = img2.load()
+        for x in range(400):
+            for y in range(300):
+                pixels1[x, y] = ((255 - x) % 256, (x * 2) % 256, y % 256)
+                pixels2[x, y] = (y % 256, (255 - y) % 256, (x * 3) % 256)
+
+        path1 = temp_dir / "image1.jpg"
+        path2 = temp_dir / "image2.jpg"
+        img1.save(path1, quality=95)
+        img2.save(path2, quality=95)
+
+        hash1 = compute_perceptual_hash(str(path1))
+        hash2 = compute_perceptual_hash(str(path2))
+
+        assert hash1 is not None
+        assert hash2 is not None
+
+        # Different images should have high distance
+        distance = hash1 - hash2
+        assert distance > 10, f"Different images have suspiciously low distance {distance}"
+
+    def test_real_compressed_duplicate_detection(self):
+        """
+        Test perceptual hash with real compressed duplicate images.
+
+        Uses sample images from ClosePhotos folder:
+        - 01-18/IMG_1709.JPG (2.3MB, with EXIF rotation)
+        - 01-18 Grace/IMG_1709.jpg (1.1MB, already rotated)
+        """
+        sample_dir = Path("/Users/dannydalal/Apps/Photo Organizer/SampleDupeFolders/ClosePhotos")
+
+        # Skip if sample images don't exist
+        if not sample_dir.exists():
+            pytest.skip("Sample ClosePhotos directory not found")
+
+        path1 = sample_dir / "01-18" / "IMG_1709.JPG"
+        path2 = sample_dir / "01-18 Grace" / "IMG_1709.jpg"
+
+        if not path1.exists() or not path2.exists():
+            pytest.skip("Sample images not found")
+
+        hash1 = compute_perceptual_hash(str(path1))
+        hash2 = compute_perceptual_hash(str(path2))
+
+        assert hash1 is not None, "Failed to compute hash for first image"
+        assert hash2 is not None, "Failed to compute hash for second image"
+
+        # These are the same image (one compressed), should have very low distance
+        distance = hash1 - hash2
+        assert distance <= 10, (
+            f"Same image with different compression should match. "
+            f"Got distance {distance}, expected <= 10"
+        )

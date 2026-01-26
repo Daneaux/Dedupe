@@ -6,6 +6,7 @@ import shutil
 import os
 
 from ..models.image_file import ImageFile
+from ..models.duplicate_group import DuplicateGroup
 
 
 class FileOperations:
@@ -160,6 +161,34 @@ class FileOperations:
 
         return results
 
+    def _move_single_file_to_trash(self, file_path: Path) -> Tuple[bool, Optional[str]]:
+        """
+        Move a single file to system trash (macOS).
+
+        Args:
+            file_path: Path to the file to trash.
+
+        Returns:
+            Tuple of (success, error_message)
+        """
+        import subprocess
+        try:
+            result = subprocess.run(
+                [
+                    "osascript", "-e",
+                    f'tell application "Finder" to delete POSIX file "{file_path}"'
+                ],
+                capture_output=True,
+                text=True
+            )
+
+            if result.returncode == 0:
+                return (True, None)
+            else:
+                return (False, f"Trash failed: {result.stderr}")
+        except Exception as e:
+            return (False, str(e))
+
     def _get_unique_path(self, path: Path) -> Path:
         """
         Get a unique path by adding a number suffix if file exists.
@@ -237,3 +266,129 @@ class FileOperations:
                 invalid.append((image, "File not found"))
 
         return valid, invalid
+
+    def move_to_target_directories(
+        self,
+        groups: List[DuplicateGroup],
+        delete_duplicates: bool = True,
+        progress_callback: Optional[Callable[[str, int, int], None]] = None
+    ) -> Tuple[List[Tuple[ImageFile, Path, bool, Optional[str]]], List[Path]]:
+        """
+        Move/merge files to their target directories (for date folder merge mode).
+
+        For each group:
+        - Keeps the suggested_keep file
+        - Either deletes duplicates or moves non-keepers to target directory
+        - Returns list of empty directories that can be removed
+
+        Args:
+            groups: List of DuplicateGroup objects with target_directory set.
+            delete_duplicates: If True, delete duplicates. If False, move to target.
+            progress_callback: Optional callback(filename, current, total).
+
+        Returns:
+            Tuple of (results, empty_directories)
+            - results: List of (image, new_path, success, error_message)
+            - empty_directories: List of directories that are now empty
+        """
+        results: List[Tuple[ImageFile, Path, bool, Optional[str]]] = []
+        directories_to_check: set = set()
+
+        # Count total operations
+        total = sum(
+            len([img for img in g.images if img != g.suggested_keep])
+            for g in groups
+        )
+        current = 0
+
+        for group in groups:
+            if not group.target_directory:
+                continue
+
+            target_dir = group.target_directory
+
+            for image in group.images:
+                # Skip the keeper
+                if image == group.suggested_keep:
+                    continue
+
+                current += 1
+                if progress_callback:
+                    progress_callback(image.filename, current, total)
+
+                # Track the source directory for later cleanup check
+                directories_to_check.add(image.directory)
+
+                try:
+                    if delete_duplicates:
+                        # Move duplicate to trash (instead of permanent deletion)
+                        if image.path.exists():
+                            success, error = self._move_single_file_to_trash(image.path)
+                            if success:
+                                results.append((image, image.path, True, None))
+                            else:
+                                results.append((image, image.path, False, error))
+                        else:
+                            results.append((image, image.path, False, "File not found"))
+                    else:
+                        # Move to target directory
+                        dest_path = target_dir / image.filename
+                        final_dest = self._get_unique_path(dest_path)
+
+                        if image.path.exists():
+                            shutil.move(str(image.path), str(final_dest))
+                            results.append((image, final_dest, True, None))
+                        else:
+                            results.append((image, image.path, False, "File not found"))
+
+                except Exception as e:
+                    results.append((image, image.path, False, str(e)))
+
+        # Check for empty directories
+        empty_dirs: List[Path] = []
+        for dir_path in directories_to_check:
+            if dir_path.exists() and dir_path.is_dir():
+                # Check if directory is empty (no files, may have subdirs)
+                has_files = any(dir_path.iterdir())
+                if not has_files:
+                    empty_dirs.append(dir_path)
+
+        return results, empty_dirs
+
+    def remove_empty_directories(
+        self,
+        directories: List[Path],
+        progress_callback: Optional[Callable[[str, int, int], None]] = None
+    ) -> List[Tuple[Path, bool, Optional[str]]]:
+        """
+        Remove empty directories.
+
+        Args:
+            directories: List of directory paths to remove.
+            progress_callback: Optional callback(dirname, current, total).
+
+        Returns:
+            List of (path, success, error_message)
+        """
+        results: List[Tuple[Path, bool, Optional[str]]] = []
+        total = len(directories)
+
+        for i, dir_path in enumerate(directories):
+            if progress_callback:
+                progress_callback(dir_path.name, i + 1, total)
+
+            try:
+                if dir_path.exists() and dir_path.is_dir():
+                    # Only remove if truly empty
+                    if not any(dir_path.iterdir()):
+                        dir_path.rmdir()
+                        results.append((dir_path, True, None))
+                    else:
+                        results.append((dir_path, False, "Directory not empty"))
+                else:
+                    results.append((dir_path, False, "Directory not found"))
+
+            except Exception as e:
+                results.append((dir_path, False, str(e)))
+
+        return results

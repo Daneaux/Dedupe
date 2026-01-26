@@ -20,11 +20,13 @@ class ResultsView(QWidget):
 
     selection_changed = pyqtSignal(list)  # Emits list of selected ImageFiles
     images_for_preview = pyqtSignal(list)  # Emits list of images to preview
+    trash_group_requested = pyqtSignal(int)  # Emits group_id when trash button clicked
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._groups: List[DuplicateGroup] = []
         self._selected_for_action: Set[str] = set()  # Paths of files selected for deletion/move
+        self._group_trash_buttons: Dict[int, QPushButton] = {}  # group_id -> button
         self._setup_ui()
 
     def _setup_ui(self):
@@ -146,13 +148,30 @@ class ResultsView(QWidget):
 
             group_type = "Intra-dir" if group.is_intra_directory else "Cross-dir"
             dir_name = group.directory.name if group.directory else "mixed"
-            group_item.setText(0, f"[{dir_name}] Group {group.group_id} ({group.file_count} files)")
+
+            # Show target directory for merge mode
+            if group.target_directory:
+                group_item.setText(0, f"[→ {group.target_directory.name}] Group {group.group_id} ({group.file_count} files)")
+            else:
+                group_item.setText(0, f"[{dir_name}] Group {group.group_id} ({group.file_count} files)")
             group_item.setText(4, f"Savings: {group.potential_savings_str}")
 
             # Expand group item
             group_item.setExpanded(True)
 
             self.tree.addTopLevelItem(group_item)
+
+            # Add trash button to the group row
+            trash_btn = QPushButton("🗑 Trash Marked")
+            trash_btn.setFixedHeight(22)
+            trash_btn.setStyleSheet(
+                "QPushButton { background-color: #ff6b6b; color: white; "
+                "font-size: 11px; padding: 2px 8px; border-radius: 3px; }"
+                "QPushButton:hover { background-color: #ee5a5a; }"
+            )
+            trash_btn.clicked.connect(lambda checked, gid=group.group_id: self._on_trash_group_clicked(gid))
+            self.tree.setItemWidget(group_item, 3, trash_btn)
+            self._group_trash_buttons[group.group_id] = trash_btn
 
             # Add image items
             for image in group.images:
@@ -172,6 +191,7 @@ class ResultsView(QWidget):
         """Populate the tree with duplicate groups."""
         self.tree.blockSignals(True)
         self.tree.clear()
+        self._group_trash_buttons.clear()
 
         filter_mode = self.filter_combo.currentIndex()
 
@@ -187,13 +207,30 @@ class ResultsView(QWidget):
             group_item.setData(0, Qt.ItemDataRole.UserRole, ("group", group.group_id))
 
             group_type = "Intra-dir" if group.is_intra_directory else "Cross-dir"
-            group_item.setText(0, f"Group {group.group_id} ({group.file_count} files) - {group_type}")
+
+            # Show target directory for merge mode
+            if group.target_directory:
+                group_item.setText(0, f"[→ {group.target_directory.name}] Group {group.group_id} ({group.file_count} files)")
+            else:
+                group_item.setText(0, f"Group {group.group_id} ({group.file_count} files) - {group_type}")
             group_item.setText(4, f"Savings: {group.potential_savings_str}")
 
             # Expand group item
             group_item.setExpanded(True)
 
             self.tree.addTopLevelItem(group_item)
+
+            # Add trash button to the group row
+            trash_btn = QPushButton("🗑 Trash Marked")
+            trash_btn.setFixedHeight(22)
+            trash_btn.setStyleSheet(
+                "QPushButton { background-color: #ff6b6b; color: white; "
+                "font-size: 11px; padding: 2px 8px; border-radius: 3px; }"
+                "QPushButton:hover { background-color: #ee5a5a; }"
+            )
+            trash_btn.clicked.connect(lambda checked, gid=group.group_id: self._on_trash_group_clicked(gid))
+            self.tree.setItemWidget(group_item, 3, trash_btn)
+            self._group_trash_buttons[group.group_id] = trash_btn
 
             # Add image items
             for image in group.images:
@@ -377,10 +414,54 @@ class ResultsView(QWidget):
                     images.append(img)
         return images
 
+    def get_group_by_id(self, group_id: int) -> Optional[DuplicateGroup]:
+        """Get a group by its ID."""
+        for group in self._groups:
+            if group.group_id == group_id:
+                return group
+        return None
+
+    def get_marked_for_deletion_in_group(self, group_id: int) -> List[ImageFile]:
+        """Get images marked for deletion in a specific group."""
+        group = self.get_group_by_id(group_id)
+        if not group:
+            return []
+
+        images = []
+        for img in group.images:
+            if str(img.path) in self._selected_for_action:
+                images.append(img)
+        return images
+
+    def _on_trash_group_clicked(self, group_id: int):
+        """Handle trash button click for a group."""
+        self.trash_group_requested.emit(group_id)
+
+    def remove_group(self, group_id: int):
+        """Remove a group from the display after it's been processed."""
+        # Find and remove the group from our list
+        self._groups = [g for g in self._groups if g.group_id != group_id]
+
+        # Remove the tree item
+        for i in range(self.tree.topLevelItemCount()):
+            item = self.tree.topLevelItem(i)
+            data = item.data(0, Qt.ItemDataRole.UserRole)
+            if data and data[0] == "group" and data[1] == group_id:
+                self.tree.takeTopLevelItem(i)
+                break
+
+        # Clean up button reference
+        if group_id in self._group_trash_buttons:
+            del self._group_trash_buttons[group_id]
+
+        self._update_summary()
+        self._update_selected_count()
+
     def clear(self):
         """Clear all results."""
         self._groups = []
         self._selected_for_action.clear()
+        self._group_trash_buttons.clear()
         self.tree.clear()
         self.summary_label.setText("No duplicates found")
         self._update_selected_count()

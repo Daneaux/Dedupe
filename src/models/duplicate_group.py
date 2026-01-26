@@ -6,6 +6,12 @@ from typing import List, Optional, Dict, Tuple
 from .image_file import ImageFile
 
 
+class KeepStrategy:
+    """Strategy for determining which file to keep."""
+    LARGEST_FILE = "largest_file"  # Keep largest file (default)
+    SHORTEST_NAME = "shortest_name"  # Keep file with shortest filename
+
+
 @dataclass
 class DuplicateGroup:
     """Represents a group of duplicate/similar images."""
@@ -15,6 +21,8 @@ class DuplicateGroup:
     similarity_scores: Dict[Tuple[str, str], float] = field(default_factory=dict)
     suggested_keep: Optional[ImageFile] = None
     is_intra_directory: bool = True
+    keep_strategy: str = KeepStrategy.LARGEST_FILE
+    target_directory: Optional[Path] = None  # For merge mode: where to move files
 
     def __post_init__(self):
         """Initialize the group and determine suggested keep."""
@@ -37,24 +45,42 @@ class DuplicateGroup:
 
     def _determine_suggested_keep(self):
         """
-        Determine which image should be kept based on priority:
-        1. Larger file size (primary - always keep the larger file)
-        2. Higher resolution as tiebreaker
+        Determine which image should be kept based on the keep strategy.
+
+        Strategies:
+        - LARGEST_FILE: Keep largest file (default), resolution as tiebreaker
+        - SHORTEST_NAME: Keep file with shortest filename, then largest size
         """
         if not self.images:
             self.suggested_keep = None
             return
 
-        # Sort by file size (largest first), then resolution as tiebreaker
-        sorted_images = sorted(
-            self.images,
-            key=lambda img: (
-                -img.file_size,    # Larger file size is better (primary)
-                -img.resolution,   # Higher resolution as tiebreaker
+        if self.keep_strategy == KeepStrategy.SHORTEST_NAME:
+            # Sort by filename length (shortest first), then file size (largest)
+            sorted_images = sorted(
+                self.images,
+                key=lambda img: (
+                    len(img.filename),  # Shorter filename is better
+                    -img.file_size,     # Larger file size as tiebreaker
+                )
             )
-        )
+        else:
+            # Default: LARGEST_FILE
+            # Sort by file size (largest first), then resolution as tiebreaker
+            sorted_images = sorted(
+                self.images,
+                key=lambda img: (
+                    -img.file_size,    # Larger file size is better (primary)
+                    -img.resolution,   # Higher resolution as tiebreaker
+                )
+            )
 
         self.suggested_keep = sorted_images[0] if sorted_images else None
+
+    def set_keep_strategy(self, strategy: str):
+        """Change the keep strategy and recalculate suggested keep."""
+        self.keep_strategy = strategy
+        self._determine_suggested_keep()
 
     def _check_intra_directory(self):
         """Check if all images are in the same directory."""
