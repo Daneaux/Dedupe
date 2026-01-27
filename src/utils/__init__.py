@@ -1,3 +1,3 @@
-"""Utility functions for the Duplicate Image Finder."""
+"""Utility functions for the Duplicate File Finder."""
 
-from .session import SessionManager, SessionInfo
+from .file_filters import FileFilter

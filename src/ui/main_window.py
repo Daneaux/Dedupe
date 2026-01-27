@@ -16,13 +16,11 @@ from .directory_selector import DirectorySelector
 from .progress_panel import ProgressPanel
 from .results_view import ResultsView
 from .image_preview import ImagePreviewPanel
-from .session_picker import SessionPickerDialog
 
 from ..core.scanner import ImageScanner
 from ..core.deduplicator import Deduplicator
 from ..core.file_operations import FileOperations
 from ..utils.export import ResultsExporter
-from ..utils.session import SessionManager
 from ..models.duplicate_group import DuplicateGroup
 from ..models.image_file import ImageFile
 
@@ -283,8 +281,6 @@ class MainWindow(QMainWindow):
         self._detection_mode: str = DetectionMode.EXACT
         self._perceptual_threshold: int = 10  # Default sensitivity (0=strict, 20=loose)
         self._hash_algorithm: str = HashAlgorithm.PHASH  # Default algorithm
-        self._session_manager = SessionManager()
-        self._current_session_id: Optional[str] = None
         self._setup_ui()
         self._setup_menu()
 
@@ -473,10 +469,6 @@ class MainWindow(QMainWindow):
         open_action.setShortcut("Ctrl+O")
         open_action.triggered.connect(self._browse_directory)
         file_menu.addAction(open_action)
-
-        sessions_action = QAction("Manage Sessions...", self)
-        sessions_action.triggered.connect(self._show_sessions)
-        file_menu.addAction(sessions_action)
 
         file_menu.addSeparator()
 
@@ -695,9 +687,6 @@ class MainWindow(QMainWindow):
                 f"Complete: {len(self._groups)} groups with {total_files} files. "
                 f"Potential savings: {self._format_size(savings)}"
             )
-
-            # Save session
-            self._save_session()
         else:
             self.status_bar.showMessage("No duplicates found")
 
@@ -1005,14 +994,8 @@ class MainWindow(QMainWindow):
             remaining = len(self._groups)
             if remaining == 0:
                 self.status_bar.showMessage("All duplicate groups processed!")
-                # Delete session when all groups are processed
-                if self._current_session_id:
-                    self._session_manager.delete_session(self._current_session_id)
-                    self._current_session_id = None
             else:
                 self.status_bar.showMessage(f"{remaining} duplicate group(s) remaining")
-                # Save session after changes
-                self._save_session()
 
     def _export_csv(self):
         """Export results to CSV."""
@@ -1089,19 +1072,6 @@ class MainWindow(QMainWindow):
                 "Failed to export summary. Check file permissions."
             )
 
-    def _show_sessions(self):
-        """Show session management dialog."""
-        picker = SessionPickerDialog(self)
-
-        def on_session_selected(session_id: str):
-            picker.accept()
-            self.load_session(session_id)
-
-        picker.session_selected.connect(on_session_selected)
-        picker.new_scan_requested.connect(picker.accept)
-
-        picker.exec()
-
     def _show_about(self):
         """Show about dialog."""
         QMessageBox.about(
@@ -1121,133 +1091,6 @@ class MainWindow(QMainWindow):
             size /= 1024
         return f"{size:.1f} TB"
 
-    def _save_session(self):
-        """Save the current session state."""
-        if not self._root_dir or not self._groups:
-            return
-
-        try:
-            selected = self.results_view._selected_for_action
-            self._current_session_id = self._session_manager.save_session(
-                root_directory=self._root_dir,
-                groups=self._groups,
-                scan_mode=self._scan_mode,
-                detection_mode=self._detection_mode,
-                hash_algorithm=self._hash_algorithm,
-                perceptual_threshold=self._perceptual_threshold,
-                selected_for_action=selected
-            )
-        except Exception as e:
-            print(f"Error saving session: {e}")
-
-    def load_session(self, session_id: str) -> bool:
-        """Load a previously saved session."""
-        session_data = self._session_manager.load_session(session_id)
-
-        if not session_data:
-            QMessageBox.warning(
-                self,
-                "Session Not Found",
-                "Could not load the selected session. It may have been deleted."
-            )
-            return False
-
-        info = session_data["info"]
-        groups = session_data["groups"]
-        selected = session_data["selected_for_action"]
-
-        # Check if directory still exists
-        root_dir = Path(info.root_directory)
-        if not root_dir.exists():
-            QMessageBox.warning(
-                self,
-                "Directory Not Found",
-                f"The directory no longer exists:\n{info.root_directory}"
-            )
-            return False
-
-        # Restore state
-        self._root_dir = root_dir
-        self._groups = groups
-        self._scan_mode = info.scan_mode
-        self._detection_mode = info.detection_mode
-        self._hash_algorithm = info.hash_algorithm
-        self._perceptual_threshold = info.perceptual_threshold
-        self._current_session_id = session_id
-
-        # Update UI to reflect loaded settings
-        self.dir_selector.set_directory(str(root_dir))
-
-        # Update mode combo
-        for i in range(self.mode_combo.count()):
-            if self.mode_combo.itemData(i) == self._scan_mode:
-                self.mode_combo.setCurrentIndex(i)
-                break
-
-        # Update detection combo
-        for i in range(self.detection_combo.count()):
-            if self.detection_combo.itemData(i) == self._detection_mode:
-                self.detection_combo.setCurrentIndex(i)
-                break
-
-        # Update algorithm combo
-        for i in range(self.algorithm_combo.count()):
-            if self.algorithm_combo.itemData(i) == self._hash_algorithm:
-                self.algorithm_combo.setCurrentIndex(i)
-                break
-
-        # Update sensitivity slider
-        self.sensitivity_slider.setValue(self._perceptual_threshold)
-
-        # Show/hide perceptual controls
-        is_perceptual = self._detection_mode == DetectionMode.PERCEPTUAL
-        self.algorithm_label.setVisible(is_perceptual)
-        self.algorithm_combo.setVisible(is_perceptual)
-        self.sensitivity_label.setVisible(is_perceptual)
-        self.sensitivity_slider.setVisible(is_perceptual)
-        self.sensitivity_value_label.setVisible(is_perceptual)
-
-        # Display results
-        self.results_view.clear()
-        self.results_view.set_groups(groups)
-
-        # Restore selection state
-        self.results_view._selected_for_action = selected
-        self.results_view._update_selected_count()
-
-        # Update checkboxes for restored selection
-        for i in range(self.results_view.tree.topLevelItemCount()):
-            group_item = self.results_view.tree.topLevelItem(i)
-            for j in range(group_item.childCount()):
-                child = group_item.child(j)
-                data = child.data(0, Qt.ItemDataRole.UserRole)
-                if data and data[0] == "image":
-                    path = data[1]
-                    if path in selected:
-                        child.setCheckState(0, Qt.CheckState.Checked)
-
-        # Enable buttons
-        if self._scan_mode == ScanMode.DATE_FOLDER_MERGE:
-            self.merge_button.setEnabled(True)
-            self.merge_button.setVisible(True)
-            self.move_button.setVisible(False)
-        else:
-            self.move_button.setEnabled(True)
-            self.move_button.setVisible(True)
-            self.merge_button.setVisible(False)
-
-        self.delete_button.setEnabled(True)
-        self.export_button.setEnabled(True)
-
-        # Update status
-        total_files = sum(len(g) for g in groups)
-        savings = sum(g.potential_savings for g in groups)
-        self.status_bar.showMessage(
-            f"Resumed: {len(groups)} groups with {total_files} files. "
-            f"Potential savings: {self._format_size(savings)}"
-        )
-
-        return True
 
     def load_volume_duplicates(self, volume_uuid: str):
         """Load and find duplicates for a specific volume.

@@ -143,6 +143,18 @@ CREATE TABLE IF NOT EXISTS unknown_extensions (
     last_seen_at TEXT NOT NULL
 );
 
+-- Sample paths for unknown/excluded extensions (to show where they were found)
+CREATE TABLE IF NOT EXISTS extension_sample_paths (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    extension TEXT NOT NULL,
+    volume_id INTEGER NOT NULL,
+    relative_path TEXT NOT NULL,  -- Directory path relative to volume mount point
+    file_count INTEGER DEFAULT 1,
+    FOREIGN KEY (volume_id) REFERENCES volumes(id) ON DELETE CASCADE,
+    UNIQUE(extension, volume_id, relative_path)
+);
+CREATE INDEX IF NOT EXISTS idx_extension_sample_paths_ext ON extension_sample_paths(extension);
+
 -- Excluded paths per volume (directories to skip during scanning)
 CREATE TABLE IF NOT EXISTS excluded_paths (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -939,6 +951,72 @@ class DatabaseManager:
         """Clear all unknown extensions."""
         with self.cursor() as cursor:
             cursor.execute("DELETE FROM unknown_extensions")
+
+    def add_extension_sample_path(
+        self,
+        extension: str,
+        volume_id: int,
+        relative_path: str
+    ):
+        """Add or update a sample path for an extension.
+
+        Used to track where unknown/excluded extensions were found during scanning.
+        """
+        ext = extension.lower().lstrip('.')
+        # Normalize path: get directory portion only
+        dir_path = str(Path(relative_path).parent) if '/' in relative_path else ''
+
+        with self.cursor() as cursor:
+            cursor.execute("""
+                INSERT INTO extension_sample_paths (extension, volume_id, relative_path, file_count)
+                VALUES (?, ?, ?, 1)
+                ON CONFLICT(extension, volume_id, relative_path)
+                DO UPDATE SET file_count = file_count + 1
+            """, (ext, volume_id, dir_path))
+
+    def get_extension_sample_paths(self, extension: str) -> List[Dict[str, Any]]:
+        """Get sample paths where an extension was found.
+
+        Returns list of dicts with 'directory', 'volume_id', 'volume_name',
+        'mount_point', and 'file_count' keys.
+        """
+        ext = extension.lower().lstrip('.')
+
+        with self.cursor() as cursor:
+            cursor.execute("""
+                SELECT
+                    esp.relative_path as directory,
+                    esp.volume_id,
+                    v.name as volume_name,
+                    v.mount_point,
+                    esp.file_count
+                FROM extension_sample_paths esp
+                JOIN volumes v ON esp.volume_id = v.id
+                WHERE esp.extension = ?
+                ORDER BY esp.file_count DESC, esp.relative_path ASC
+            """, (ext,))
+
+            results = []
+            for row in cursor.fetchall():
+                results.append({
+                    'directory': row[0] or '/',
+                    'volume_id': row[1],
+                    'volume_name': row[2],
+                    'mount_point': row[3],
+                    'file_count': row[4]
+                })
+            return results
+
+    def clear_extension_sample_paths(self, volume_id: Optional[int] = None):
+        """Clear sample paths, optionally for a specific volume."""
+        with self.cursor() as cursor:
+            if volume_id:
+                cursor.execute(
+                    "DELETE FROM extension_sample_paths WHERE volume_id = ?",
+                    (volume_id,)
+                )
+            else:
+                cursor.execute("DELETE FROM extension_sample_paths")
 
     def get_extension_counts(self) -> Dict[str, int]:
         """Get counts of files by extension from the files table."""

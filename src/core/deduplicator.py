@@ -924,13 +924,9 @@ class Deduplicator:
                 # Create ImageFile for compatibility with existing UI
                 img = ImageFile(
                     path=full_path,
-                    filename=f['filename'],
-                    extension=f.get('extension', ''),
-                    size_bytes=f['file_size_bytes'],
-                    width=f.get('width'),
-                    height=f.get('height'),
-                    created_at=f.get('file_created_at'),
-                    modified_at=f.get('file_modified_at'),
+                    file_size=f['file_size_bytes'],
+                    width=f.get('width') or 0,
+                    height=f.get('height') or 0,
                 )
                 # Store DB info for reference
                 img.db_file_id = f['id']
@@ -1033,13 +1029,9 @@ class Deduplicator:
 
                 img = ImageFile(
                     path=full_path,
-                    filename=f['filename'],
-                    extension=f.get('extension', ''),
-                    size_bytes=f['file_size_bytes'],
-                    width=f.get('width'),
-                    height=f.get('height'),
-                    created_at=f.get('file_created_at'),
-                    modified_at=f.get('file_modified_at'),
+                    file_size=f['file_size_bytes'],
+                    width=f.get('width') or 0,
+                    height=f.get('height') or 0,
                 )
                 img.db_file_id = f['id']
                 img.db_volume_id = f['volume_id']

@@ -4,9 +4,62 @@ from pathlib import Path
 from typing import List, Optional, Tuple, Callable
 import shutil
 import os
+import subprocess
 
 from ..models.image_file import ImageFile
 from ..models.duplicate_group import DuplicateGroup
+
+
+def move_to_trash(file_path: Path) -> bool:
+    """
+    Move a single file to system trash.
+
+    Works on macOS using osascript, falls back to permanent delete on other platforms.
+
+    Args:
+        file_path: Path to the file to trash.
+
+    Returns:
+        True if successful, False otherwise.
+    """
+    import platform
+
+    if not file_path.exists():
+        return False
+
+    try:
+        if platform.system() == "Darwin":  # macOS
+            result = subprocess.run(
+                [
+                    "osascript", "-e",
+                    f'tell application "Finder" to delete POSIX file "{file_path}"'
+                ],
+                capture_output=True,
+                text=True
+            )
+            return result.returncode == 0
+        elif platform.system() == "Windows":
+            # Use send2trash if available, otherwise fall back to delete
+            try:
+                import send2trash
+                send2trash.send2trash(str(file_path))
+                return True
+            except ImportError:
+                file_path.unlink()
+                return True
+        else:
+            # Linux - try trash-cli or gio, fallback to delete
+            try:
+                result = subprocess.run(
+                    ["gio", "trash", str(file_path)],
+                    capture_output=True
+                )
+                return result.returncode == 0
+            except FileNotFoundError:
+                file_path.unlink()
+                return True
+    except Exception:
+        return False
 
 
 class FileOperations:

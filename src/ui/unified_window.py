@@ -703,15 +703,17 @@ class DirectoryListItem(QListWidgetItem):
 class ExtensionDirectoriesDialog(QDialog):
     """Dialog showing directories containing files with a specific extension."""
 
-    def __init__(self, extension: str, parent=None):
+    def __init__(self, extension: str, parent=None, use_sample_paths: bool = False):
         super().__init__(parent)
         self.extension = extension.lower().lstrip('.')
+        self.use_sample_paths = use_sample_paths
         self.db = DatabaseManager.get_instance()
         self._setup_ui()
         self._load_directories()
 
     def _setup_ui(self):
-        self.setWindowTitle(f"Directories containing .{self.extension} files")
+        title_suffix = " (not indexed)" if self.use_sample_paths else ""
+        self.setWindowTitle(f"Directories containing .{self.extension} files{title_suffix}")
         self.setMinimumSize(600, 400)
         self.resize(700, 500)
 
@@ -719,15 +721,22 @@ class ExtensionDirectoriesDialog(QDialog):
         layout.setSpacing(12)
 
         # Header
-        header = QLabel(f"Directories containing .{self.extension} files")
+        header = QLabel(f"Directories containing .{self.extension} files{title_suffix}")
         header_font = QFont()
         header_font.setPointSize(14)
         header_font.setBold(True)
         header.setFont(header_font)
         layout.addWidget(header)
 
-        subtitle = QLabel("Double-click a directory to open it in your file manager")
+        if self.use_sample_paths:
+            subtitle = QLabel(
+                "These directories contain files that were skipped during scanning. "
+                "Double-click to open in file manager."
+            )
+        else:
+            subtitle = QLabel("Double-click a directory to open it in your file manager")
         subtitle.setStyleSheet("color: #666; font-size: 12px;")
+        subtitle.setWordWrap(True)
         layout.addWidget(subtitle)
 
         # Directory list
@@ -770,18 +779,31 @@ class ExtensionDirectoriesDialog(QDialog):
 
     def _load_directories(self):
         """Load directories from database."""
-        directories = self.db.get_directories_by_extension(self.extension)
+        # Use sample paths for unknown/excluded extensions, or regular paths for included
+        if self.use_sample_paths:
+            directories = self.db.get_extension_sample_paths(self.extension)
+        else:
+            directories = self.db.get_directories_by_extension(self.extension)
 
         total_files = 0
         total_dirs = len(directories)
 
         if not directories:
             # Show empty state message
-            empty_item = QListWidgetItem(
-                f"No indexed files with .{self.extension} extension found.\n\n"
-                "This extension may not have been encountered during scanning,\n"
-                "or all files with this extension have been deleted."
-            )
+            if self.use_sample_paths:
+                empty_msg = (
+                    f"No directory information available for .{self.extension} files.\n\n"
+                    "This extension was encountered during scanning but directory\n"
+                    "information was not recorded. Re-scan your drives to collect\n"
+                    "directory information for this extension."
+                )
+            else:
+                empty_msg = (
+                    f"No indexed files with .{self.extension} extension found.\n\n"
+                    "This extension may not have been encountered during scanning,\n"
+                    "or all files with this extension have been deleted."
+                )
+            empty_item = QListWidgetItem(empty_msg)
             empty_item.setFlags(Qt.ItemFlag.NoItemFlags)
             empty_item.setForeground(QBrush(QColor("#666")))
             self.dir_list.addItem(empty_item)
@@ -815,8 +837,9 @@ class ExtensionDirectoriesDialog(QDialog):
             self.dir_list.addItem(item)
             total_files += dir_info['file_count']
 
+        status_suffix = " (skipped)" if self.use_sample_paths else ""
         self.stats_label.setText(
-            f"{total_dirs} directories, {total_files:,} total .{self.extension} files"
+            f"{total_dirs} directories, {total_files:,} total .{self.extension} files{status_suffix}"
         )
 
     def _on_selection_changed(self):
@@ -1108,17 +1131,10 @@ class FileTypesTab(QWidget):
             )
             return
 
-        # For unknown/excluded extensions, files were encountered but not indexed
+        # For unknown/excluded extensions, show sample paths if available
         if is_unknown or is_excluded:
-            list_type = "unknown" if is_unknown else "excluded"
-            QMessageBox.information(
-                self,
-                "Files Not Indexed",
-                f"Files with extension .{ext} were encountered {count:,} times during scanning, "
-                f"but were not indexed because this extension is in the {list_type} list.\n\n"
-                "To see directories containing these files, move this extension to the "
-                "Include list, save changes, and re-scan your drives."
-            )
+            dialog = ExtensionDirectoriesDialog(ext, self, use_sample_paths=True)
+            dialog.exec()
             return
 
         # Show directories dialog for included extensions
@@ -1340,15 +1356,40 @@ class DuplicateFindWorker(QThread):
 
             if self.mode == 'intra':
                 # Find duplicates within a single source
+                # Search across all hash types to find all duplicates
                 volume_ids = [self.source1_id] if self.source1_id else None
-                groups = deduplicator.find_duplicates_from_db(
+                all_groups = []
+                group_id_offset = 0
+
+                # Search pixel_md5 first (lossless images, RAW files)
+                progress_cb("Finding pixel-identical duplicates...", 0, 0)
+                pixel_groups = deduplicator.find_duplicates_from_db(
                     volume_ids=volume_ids,
+                    hash_type="pixel_md5",
                     progress_callback=progress_cb
                 )
+                all_groups.extend(pixel_groups)
+                group_id_offset = len(all_groups)
+
+                # Search exact_md5 (videos, documents, audio)
+                progress_cb("Finding file-identical duplicates...", 0, 0)
+                exact_groups = deduplicator.find_duplicates_from_db(
+                    volume_ids=volume_ids,
+                    hash_type="exact_md5",
+                    progress_callback=progress_cb
+                )
+                # Renumber group IDs to avoid conflicts
+                for g in exact_groups:
+                    g.group_id = g.group_id + group_id_offset
+                all_groups.extend(exact_groups)
+
+                groups = all_groups
             else:
                 # Find duplicates across two sources (intersection)
+                # Use pixel_md5 for cross-volume (most reliable for images)
                 groups = deduplicator.find_cross_volume_duplicates(
                     volume_ids=[self.source1_id, self.source2_id],
+                    hash_type="pixel_md5",
                     progress_callback=progress_cb
                 )
 
@@ -1524,18 +1565,35 @@ class DuplicatesTab(QWidget):
         layout.addLayout(action_row)
 
     def refresh_sources(self):
-        """Refresh source dropdowns with indexed volumes."""
+        """Refresh source dropdowns with indexed volumes, preserving selection."""
+        # Save current selections
+        current_source1_id = self.source1_combo.currentData()
+        current_source2_id = self.source2_combo.currentData()
+
         self.source1_combo.clear()
         self.source2_combo.clear()
 
         self.source1_combo.addItem("-- Select a drive --", None)
         self.source2_combo.addItem("-- Select a drive --", None)
 
-        for vol in self.db.get_all_volumes():
+        source1_index = 0
+        source2_index = 0
+
+        for i, vol in enumerate(self.db.get_all_volumes()):
             if (vol.get('file_count') or 0) > 0:
                 name = f"{vol['name']} ({vol['file_count']:,} files)"
                 self.source1_combo.addItem(name, vol['id'])
                 self.source2_combo.addItem(name, vol['id'])
+
+                # Restore selection if this was the previously selected volume
+                if vol['id'] == current_source1_id:
+                    source1_index = self.source1_combo.count() - 1
+                if vol['id'] == current_source2_id:
+                    source2_index = self.source2_combo.count() - 1
+
+        # Restore selections
+        self.source1_combo.setCurrentIndex(source1_index)
+        self.source2_combo.setCurrentIndex(source2_index)
 
     def _on_mode_changed(self):
         """Handle mode radio button change."""
@@ -1840,6 +1898,7 @@ class UnifiedWindow(QMainWindow):
         # Connect signals
         self.drives_tab.scan_completed.connect(self._on_scan_completed)
         self.file_types_tab.settings_changed.connect(self._on_file_types_changed)
+        self.tabs.currentChanged.connect(self._on_tab_changed)
 
         layout.addWidget(self.tabs)
 
@@ -1854,6 +1913,12 @@ class UnifiedWindow(QMainWindow):
         """Handle file types settings change."""
         # Could reload classifier settings here if needed
         pass
+
+    def _on_tab_changed(self, index: int):
+        """Handle tab switch - refresh data as needed."""
+        # Duplicates tab is index 2
+        if index == 2:
+            self.duplicates_tab.refresh_sources()
 
     def _check_interrupted_scans(self):
         """Check for interrupted scans on startup."""

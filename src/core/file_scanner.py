@@ -301,6 +301,8 @@ class FileScanner:
                     ext = file_path.suffix.lower().lstrip('.')
                     if ext:  # Only track if there's an extension
                         self.db.add_unknown_extension(ext)
+                        # Also record the path for directory listing
+                        self.db.add_extension_sample_path(ext, volume_id, relative_path)
                     continue
 
                 # Check file filter (including size check)
