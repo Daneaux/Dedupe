@@ -176,8 +176,20 @@ EXTENSION_HASH_OVERRIDE: Dict[str, str] = {
 class FileClassifier:
     """Classifies files by type and determines hash strategy."""
 
-    def __init__(self):
-        self._extension_to_type = self._build_extension_map()
+    def __init__(self, use_custom_settings: bool = True):
+        """Initialize the file classifier.
+
+        Args:
+            use_custom_settings: If True, load custom extension settings from database
+        """
+        self._base_extension_to_type = self._build_extension_map()
+        self._custom_includes: Set[str] = set()
+        self._custom_excludes: Set[str] = set()
+
+        if use_custom_settings:
+            self._load_custom_settings()
+
+        self._extension_to_type = self._apply_custom_settings()
 
     def _build_extension_map(self) -> Dict[str, str]:
         """Build extension to file type mapping."""
@@ -199,6 +211,60 @@ class FileClassifier:
             mapping[ext] = FileType.ARCHIVE
 
         return mapping
+
+    def _load_custom_settings(self):
+        """Load custom extension settings from the database."""
+        try:
+            from .database import DatabaseManager
+            db = DatabaseManager.get_instance()
+            self._custom_includes = set(db.get_custom_included_extensions())
+            self._custom_excludes = set(db.get_custom_excluded_extensions())
+        except Exception:
+            # Database not available or error, use defaults
+            self._custom_includes = set()
+            self._custom_excludes = set()
+
+    def _apply_custom_settings(self) -> Dict[str, str]:
+        """Apply custom include/exclude settings to the extension map."""
+        mapping = dict(self._base_extension_to_type)
+
+        # Remove excluded extensions
+        for ext in self._custom_excludes:
+            mapping.pop(ext, None)
+
+        # Add custom included extensions (classify as 'other' by default
+        # but still include them in scanning)
+        for ext in self._custom_includes:
+            if ext not in mapping:
+                # Determine type based on common patterns or default to document
+                mapping[ext] = self._guess_file_type(ext)
+
+        return mapping
+
+    def _guess_file_type(self, ext: str) -> str:
+        """Guess file type for a custom included extension."""
+        # Check if it looks like an image, video, etc.
+        ext = ext.lower()
+
+        # Image-like extensions
+        if any(hint in ext for hint in ['img', 'pic', 'photo', 'image']):
+            return FileType.IMAGE
+
+        # Video-like extensions
+        if any(hint in ext for hint in ['vid', 'movie', 'clip']):
+            return FileType.VIDEO
+
+        # Audio-like extensions
+        if any(hint in ext for hint in ['aud', 'sound', 'music']):
+            return FileType.AUDIO
+
+        # Default to document (generic file type)
+        return FileType.DOCUMENT
+
+    def reload_custom_settings(self):
+        """Reload custom settings from the database."""
+        self._load_custom_settings()
+        self._extension_to_type = self._apply_custom_settings()
 
     def get_file_type(self, file_path: Path) -> str:
         """Get the file type for a given file.

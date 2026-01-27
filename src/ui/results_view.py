@@ -45,7 +45,8 @@ class ResultsView(QWidget):
         self.filter_combo.addItems([
             "All Duplicates",
             "Intra-directory Only",
-            "Cross-directory Only"
+            "Cross-directory Only",
+            "Cross-volume Only"
         ])
         self.filter_combo.currentIndexChanged.connect(self._apply_filter)
         toolbar.addWidget(self.filter_combo)
@@ -61,7 +62,7 @@ class ResultsView(QWidget):
         # Tree widget for results
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels([
-            "Name", "Size", "Resolution", "Path", "Action"
+            "Name", "Size", "Resolution", "Volume", "Path", "Action"
         ])
         self.tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.tree.setAlternatingRowColors(True)
@@ -73,8 +74,9 @@ class ResultsView(QWidget):
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)  # Volume
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)  # Path
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)  # Action
 
         self.tree.setColumnWidth(0, 200)
 
@@ -137,24 +139,35 @@ class ResultsView(QWidget):
 
         for group in new_groups:
             # Apply filter
+            is_cross_volume = getattr(group, 'is_cross_volume', False)
             if filter_mode == 1 and not group.is_intra_directory:
                 continue
             if filter_mode == 2 and group.is_intra_directory:
+                continue
+            if filter_mode == 3 and not is_cross_volume:
                 continue
 
             # Create group item
             group_item = QTreeWidgetItem()
             group_item.setData(0, Qt.ItemDataRole.UserRole, ("group", group.group_id))
 
-            group_type = "Intra-dir" if group.is_intra_directory else "Cross-dir"
+            # Determine group type label
+            if is_cross_volume:
+                group_type = "Cross-volume"
+            elif group.is_intra_directory:
+                group_type = "Intra-dir"
+            else:
+                group_type = "Cross-dir"
             dir_name = group.directory.name if group.directory else "mixed"
 
             # Show target directory for merge mode
             if group.target_directory:
                 group_item.setText(0, f"[→ {group.target_directory.name}] Group {group.group_id} ({group.file_count} files)")
+            elif is_cross_volume:
+                group_item.setText(0, f"[Cross-volume] Group {group.group_id} ({group.file_count} files)")
             else:
                 group_item.setText(0, f"[{dir_name}] Group {group.group_id} ({group.file_count} files)")
-            group_item.setText(4, f"Savings: {group.potential_savings_str}")
+            group_item.setText(5, f"Savings: {group.potential_savings_str}")
 
             # Expand group item
             group_item.setExpanded(True)
@@ -170,7 +183,7 @@ class ResultsView(QWidget):
                 "QPushButton:hover { background-color: #ee5a5a; }"
             )
             trash_btn.clicked.connect(lambda checked, gid=group.group_id: self._on_trash_group_clicked(gid))
-            self.tree.setItemWidget(group_item, 3, trash_btn)
+            self.tree.setItemWidget(group_item, 4, trash_btn)
             self._group_trash_buttons[group.group_id] = trash_btn
 
             # Add image items
@@ -197,23 +210,32 @@ class ResultsView(QWidget):
 
         for group in self._groups:
             # Apply filter
+            is_cross_volume = getattr(group, 'is_cross_volume', False)
             if filter_mode == 1 and not group.is_intra_directory:
                 continue
             if filter_mode == 2 and group.is_intra_directory:
+                continue
+            if filter_mode == 3 and not is_cross_volume:
                 continue
 
             # Create group item
             group_item = QTreeWidgetItem()
             group_item.setData(0, Qt.ItemDataRole.UserRole, ("group", group.group_id))
 
-            group_type = "Intra-dir" if group.is_intra_directory else "Cross-dir"
+            # Determine group type label
+            if is_cross_volume:
+                group_type = "Cross-volume"
+            elif group.is_intra_directory:
+                group_type = "Intra-dir"
+            else:
+                group_type = "Cross-dir"
 
             # Show target directory for merge mode
             if group.target_directory:
                 group_item.setText(0, f"[→ {group.target_directory.name}] Group {group.group_id} ({group.file_count} files)")
             else:
                 group_item.setText(0, f"Group {group.group_id} ({group.file_count} files) - {group_type}")
-            group_item.setText(4, f"Savings: {group.potential_savings_str}")
+            group_item.setText(5, f"Savings: {group.potential_savings_str}")
 
             # Expand group item
             group_item.setExpanded(True)
@@ -229,7 +251,7 @@ class ResultsView(QWidget):
                 "QPushButton:hover { background-color: #ee5a5a; }"
             )
             trash_btn.clicked.connect(lambda checked, gid=group.group_id: self._on_trash_group_clicked(gid))
-            self.tree.setItemWidget(group_item, 3, trash_btn)
+            self.tree.setItemWidget(group_item, 4, trash_btn)
             self._group_trash_buttons[group.group_id] = trash_btn
 
             # Add image items
@@ -262,14 +284,24 @@ class ResultsView(QWidget):
         item.setText(0, image.filename)
         item.setText(1, image.file_size_str)
         item.setText(2, image.dimensions_str)
-        item.setText(3, str(image.directory))
-        item.setText(4, "KEEP" if is_suggested_keep else "DELETE")
+
+        # Volume column - show volume name if available (for cross-drive duplicates)
+        volume_name = getattr(image, 'volume_name', None)
+        if volume_name:
+            item.setText(3, volume_name)
+            # Color-code different volumes
+            item.setForeground(3, QBrush(QColor("#1565c0")))  # Blue for volume info
+        else:
+            item.setText(3, "-")
+
+        item.setText(4, str(image.directory))
+        item.setText(5, "KEEP" if is_suggested_keep else "DELETE")
 
         # Style the action column based on recommendation
         if is_suggested_keep:
-            item.setForeground(4, QBrush(QColor("green")))
+            item.setForeground(5, QBrush(QColor("green")))
         else:
-            item.setForeground(4, QBrush(QColor("red")))
+            item.setForeground(5, QBrush(QColor("red")))
 
         return item
 
@@ -324,12 +356,12 @@ class ResultsView(QWidget):
 
         if is_checked:
             self._selected_for_action.add(path)
-            item.setText(4, "DELETE")
-            item.setForeground(4, QBrush(QColor("red")))
+            item.setText(5, "DELETE")
+            item.setForeground(5, QBrush(QColor("red")))
         else:
             self._selected_for_action.discard(path)
-            item.setText(4, "KEEP")
-            item.setForeground(4, QBrush(QColor("green")))
+            item.setText(5, "KEEP")
+            item.setForeground(5, QBrush(QColor("green")))
 
         self._update_selected_count()
 
@@ -350,8 +382,8 @@ class ResultsView(QWidget):
                         if group.suggested_keep and str(group.suggested_keep.path) == path:
                             child.setCheckState(0, Qt.CheckState.Unchecked)
                             self._selected_for_action.discard(path)
-                            child.setText(4, "KEEP")
-                            child.setForeground(4, QBrush(QColor("green")))
+                            child.setText(5, "KEEP")
+                            child.setForeground(5, QBrush(QColor("green")))
                             break
 
         self.tree.blockSignals(False)
@@ -378,8 +410,8 @@ class ResultsView(QWidget):
                     if not is_keeper:
                         child.setCheckState(0, Qt.CheckState.Checked)
                         self._selected_for_action.add(path)
-                        child.setText(4, "DELETE")
-                        child.setForeground(4, QBrush(QColor("red")))
+                        child.setText(5, "DELETE")
+                        child.setForeground(5, QBrush(QColor("red")))
 
         self.tree.blockSignals(False)
         self._update_selected_count()
@@ -393,8 +425,8 @@ class ResultsView(QWidget):
             for j in range(group_item.childCount()):
                 child = group_item.child(j)
                 child.setCheckState(0, Qt.CheckState.Unchecked)
-                child.setText(4, "KEEP")
-                child.setForeground(4, QBrush(QColor("green")))
+                child.setText(5, "KEEP")
+                child.setForeground(5, QBrush(QColor("green")))
 
         self._selected_for_action.clear()
         self.tree.blockSignals(False)

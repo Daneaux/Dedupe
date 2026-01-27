@@ -21,6 +21,7 @@ class DuplicateGroup:
     similarity_scores: Dict[Tuple[str, str], float] = field(default_factory=dict)
     suggested_keep: Optional[ImageFile] = None
     is_intra_directory: bool = True
+    is_cross_volume: bool = False  # True if files span multiple volumes/drives
     keep_strategy: str = KeepStrategy.LARGEST_FILE
     target_directory: Optional[Path] = None  # For merge mode: where to move files
 

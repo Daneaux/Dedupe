@@ -2,20 +2,55 @@
 
 This scanner supports images, videos, documents, and audio files,
 with filtering for system files and integration with the hash database.
+
+Supports multi-threaded hash computation for improved performance on multi-core systems.
 """
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, Future, as_completed
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Callable, Generator, Dict, Tuple, TYPE_CHECKING
 import os
+import threading
+import warnings
 
 from .database import DatabaseManager
-from .file_classifier import FileClassifier, FileType
+
+# Configure PIL to handle large images (panoramas, high-res scans, etc.)
+# Default limit is ~89MP, increase to ~500MP (e.g., 22000x22000)
+try:
+    from PIL import Image
+    Image.MAX_IMAGE_PIXELS = 500_000_000  # 500 million pixels
+except ImportError:
+    pass
+from .file_classifier import FileClassifier, FileType, HashType
 from .volume_manager import VolumeManager, VolumeInfo
 from ..utils.file_filters import FileFilter
 from ..models.scanned_file import ScannedFile
+
+
+@dataclass
+class HashJob:
+    """A job for computing hashes in a worker thread."""
+    file_id: int
+    file_path: Path
+    file_type: str
+    primary_hash_type: str
+    secondary_hash_type: Optional[str] = None
+
+
+@dataclass
+class HashResult:
+    """Result from a hash computation job."""
+    file_id: int
+    primary_hash_type: str
+    primary_hash_value: Optional[str]
+    secondary_hash_type: Optional[str] = None
+    secondary_hash_value: Optional[str] = None
+    error: Optional[str] = None
 
 
 class ScanStats:
@@ -46,10 +81,20 @@ class ScanStats:
 
 
 class FileScanner:
-    """Scans directories for personal files with filtering and database integration."""
+    """Scans directories for personal files with filtering and database integration.
+
+    Supports multi-threaded hash computation for improved performance on multi-core systems.
+    The number of worker threads can be configured (defaults to CPU count).
+    """
 
     # How often to save checkpoints (every N files)
     CHECKPOINT_INTERVAL = 100
+
+    # Default number of hash worker threads (0 = auto-detect based on CPU count)
+    DEFAULT_HASH_WORKERS = 0
+
+    # Size of the hash job batch before waiting for results
+    HASH_BATCH_SIZE = 50
 
     def __init__(
         self,
@@ -57,6 +102,7 @@ class FileScanner:
         file_filter: Optional[FileFilter] = None,
         file_classifier: Optional[FileClassifier] = None,
         volume_manager: Optional[VolumeManager] = None,
+        hash_workers: int = 0,
     ):
         """Initialize the scanner.
 
@@ -65,6 +111,8 @@ class FileScanner:
             file_filter: File filter for excluding system files
             file_classifier: File classifier for determining file types
             volume_manager: Volume manager for drive detection
+            hash_workers: Number of threads for parallel hash computation.
+                         0 = auto-detect (uses CPU count), 1 = single-threaded
         """
         self.db = db_manager or DatabaseManager.get_instance()
         self.file_filter = file_filter or FileFilter()
@@ -78,6 +126,20 @@ class FileScanner:
         self._current_directory: str = ""
         self._directories_completed: List[str] = []
         self._total_files: int = 0
+        self._excluded_paths: List[str] = []  # User-defined excluded paths
+        self._volume_mount_point: Optional[Path] = None  # For relative path calculations
+
+        # Multi-threading configuration
+        if hash_workers == 0:
+            # Auto-detect: use CPU count, but cap at reasonable limit
+            import multiprocessing
+            self._hash_workers = min(multiprocessing.cpu_count(), 16)
+        else:
+            self._hash_workers = max(1, hash_workers)
+
+        self._thread_pool: Optional[ThreadPoolExecutor] = None
+        self._pending_hash_futures: List[Future] = []
+        self._db_lock = threading.Lock()  # Lock for thread-safe DB writes
 
     def cancel(self):
         """Cancel the current scan operation."""
@@ -96,6 +158,14 @@ class FileScanner:
         self._current_directory = ""
         self._directories_completed = []
         self._total_files = 0
+        self._excluded_paths = []
+        self._volume_mount_point = None
+        self._pending_hash_futures = []
+
+        # Shutdown existing thread pool if any
+        if self._thread_pool:
+            self._thread_pool.shutdown(wait=False)
+            self._thread_pool = None
 
     @property
     def is_paused(self) -> bool:
@@ -106,6 +176,34 @@ class FileScanner:
     def session_id(self) -> Optional[int]:
         """Get current session ID."""
         return self._current_session_id
+
+    def _is_path_excluded(self, dir_path: Path) -> bool:
+        """Check if a directory path matches any user-defined excluded path.
+
+        Args:
+            dir_path: Absolute path to check
+
+        Returns:
+            True if path should be excluded, False otherwise
+        """
+        if not self._excluded_paths or not self._volume_mount_point:
+            return False
+
+        # Get relative path from mount point
+        try:
+            relative = dir_path.relative_to(self._volume_mount_point)
+            relative_str = str(relative)
+        except ValueError:
+            # Path is not under the mount point
+            return False
+
+        # Check if this path matches or is under any excluded path
+        for excluded in self._excluded_paths:
+            # Check if the path equals or starts with the excluded path
+            if relative_str == excluded or relative_str.startswith(excluded + '/'):
+                return True
+
+        return False
 
     def scan_volume(
         self,
@@ -136,6 +234,12 @@ class FileScanner:
             total_size_bytes=volume_info.total_bytes,
             filesystem=volume_info.filesystem,
         )
+
+        # Store mount point for relative path calculations
+        self._volume_mount_point = volume_info.mount_point
+
+        # Load user-defined excluded paths for this volume
+        self._excluded_paths = self.db.get_excluded_paths(volume_id)
 
         # Determine scan root
         root_path = scan_path or volume_info.mount_point
@@ -192,8 +296,11 @@ class FileScanner:
                 # Determine file type
                 file_type = self.classifier.get_file_type(file_path)
 
-                # Skip unsupported files
+                # Skip unsupported files but track unknown extensions
                 if file_type == FileType.OTHER:
+                    ext = file_path.suffix.lower().lstrip('.')
+                    if ext:  # Only track if there's an extension
+                        self.db.add_unknown_extension(ext)
                     continue
 
                 # Check file filter (including size check)
@@ -233,7 +340,7 @@ class FileScanner:
                 )
 
                 # Store in database
-                self.db.add_file(
+                file_id = self.db.add_file(
                     volume_id=volume_id,
                     relative_path=relative_path,
                     filename=scanned_file.filename,
@@ -247,6 +354,9 @@ class FileScanner:
                     file_modified_at=scanned_file.file_modified_at.isoformat() if scanned_file.file_modified_at else None,
                 )
 
+                # Compute and store hash for the file
+                self._compute_and_store_hash(file_id, file_path, file_type)
+
                 processed += 1
                 self._stats.files_scanned += 1
 
@@ -257,6 +367,10 @@ class FileScanner:
                 # Save checkpoint periodically
                 if processed % self.CHECKPOINT_INTERVAL == 0:
                     self._save_checkpoint(session_id, current_dir, processed, total_files)
+
+            # Wait for all pending hash jobs to complete before finalizing
+            if self._hash_workers > 1:
+                self._process_completed_hash_futures(wait_all=True)
 
             # Update scan session
             self.db.update_scan_session(
@@ -301,6 +415,10 @@ class FileScanner:
             return session_id, self._stats
 
         except Exception as e:
+            # Wait for pending hash jobs before error handling
+            if self._hash_workers > 1:
+                self._process_completed_hash_futures(wait_all=True)
+
             # Save checkpoint on error so scan can be resumed
             self._save_checkpoint(session_id, self._current_directory, processed, total_files)
             self.db.complete_scan_session(
@@ -309,6 +427,12 @@ class FileScanner:
                 error_message=str(e)
             )
             raise
+
+        finally:
+            # Clean up thread pool
+            if self._thread_pool:
+                self._thread_pool.shutdown(wait=False)
+                self._thread_pool = None
 
     def _save_checkpoint(
         self,
@@ -411,6 +535,7 @@ class FileScanner:
             dirnames[:] = [
                 d for d in dirnames
                 if self.file_filter.should_include_directory(current_dir / d)
+                and not self._is_path_excluded(current_dir / d)
             ]
 
             # Skip files if directory already completed (for resume)
@@ -472,10 +597,12 @@ class FileScanner:
                 except ImportError:
                     pass
             else:
-                # Standard image formats
-                with Image.open(file_path) as img:
-                    scanned_file.width = img.width
-                    scanned_file.height = img.height
+                # Standard image formats - suppress warnings for large images
+                with warnings.catch_warnings():
+                    warnings.filterwarnings('ignore', category=Image.DecompressionBombWarning)
+                    with Image.open(file_path) as img:
+                        scanned_file.width = img.width
+                        scanned_file.height = img.height
 
         except Exception:
             pass  # Metadata loading is optional
@@ -511,3 +638,329 @@ class FileScanner:
 
         except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
             pass  # ffprobe not available or failed
+
+    def _create_hash_job(
+        self,
+        file_id: int,
+        file_path: Path,
+        file_type: str
+    ) -> HashJob:
+        """Create a hash job for a file.
+
+        Args:
+            file_id: Database ID of the file
+            file_path: Path to the file
+            file_type: File type (image, video, etc.)
+
+        Returns:
+            HashJob ready for processing
+        """
+        primary_hash, secondary_hash = self.classifier.get_hash_strategy(file_path)
+        return HashJob(
+            file_id=file_id,
+            file_path=file_path,
+            file_type=file_type,
+            primary_hash_type=primary_hash,
+            secondary_hash_type=secondary_hash
+        )
+
+    def _process_hash_job(self, job: HashJob) -> HashResult:
+        """Process a hash job (runs in worker thread).
+
+        Args:
+            job: The hash job to process
+
+        Returns:
+            HashResult with computed hashes
+        """
+        try:
+            # Compute primary hash
+            primary_value = self._compute_hash(
+                job.file_path, job.primary_hash_type, job.file_type
+            )
+
+            # Compute secondary hash if defined
+            secondary_value = None
+            if job.secondary_hash_type:
+                secondary_value = self._compute_hash(
+                    job.file_path, job.secondary_hash_type, job.file_type
+                )
+
+            return HashResult(
+                file_id=job.file_id,
+                primary_hash_type=job.primary_hash_type,
+                primary_hash_value=primary_value,
+                secondary_hash_type=job.secondary_hash_type,
+                secondary_hash_value=secondary_value
+            )
+        except Exception as e:
+            return HashResult(
+                file_id=job.file_id,
+                primary_hash_type=job.primary_hash_type,
+                primary_hash_value=None,
+                error=str(e)
+            )
+
+    def _store_hash_result(self, result: HashResult):
+        """Store hash result in the database (thread-safe).
+
+        Args:
+            result: Hash result to store
+        """
+        if result.error:
+            return
+
+        with self._db_lock:
+            if result.primary_hash_value:
+                self.db.add_hash(
+                    result.file_id,
+                    result.primary_hash_type,
+                    result.primary_hash_value
+                )
+            if result.secondary_hash_value and result.secondary_hash_type:
+                self.db.add_hash(
+                    result.file_id,
+                    result.secondary_hash_type,
+                    result.secondary_hash_value
+                )
+
+    def _submit_hash_job(self, job: HashJob):
+        """Submit a hash job to the thread pool.
+
+        Args:
+            job: Hash job to submit
+        """
+        if self._thread_pool is None:
+            self._thread_pool = ThreadPoolExecutor(
+                max_workers=self._hash_workers,
+                thread_name_prefix="hash_worker"
+            )
+
+        future = self._thread_pool.submit(self._process_hash_job, job)
+        self._pending_hash_futures.append(future)
+
+        # Process completed futures if we have a batch ready
+        if len(self._pending_hash_futures) >= self.HASH_BATCH_SIZE:
+            self._process_completed_hash_futures()
+
+    def _process_completed_hash_futures(self, wait_all: bool = False):
+        """Process completed hash futures and store results.
+
+        Args:
+            wait_all: If True, wait for all pending futures to complete
+        """
+        if not self._pending_hash_futures:
+            return
+
+        if wait_all:
+            # Wait for all futures to complete
+            for future in as_completed(self._pending_hash_futures):
+                try:
+                    result = future.result()
+                    self._store_hash_result(result)
+                except Exception:
+                    pass  # Already handled in _process_hash_job
+            self._pending_hash_futures.clear()
+        else:
+            # Process only completed futures
+            still_pending = []
+            for future in self._pending_hash_futures:
+                if future.done():
+                    try:
+                        result = future.result()
+                        self._store_hash_result(result)
+                    except Exception:
+                        pass
+                else:
+                    still_pending.append(future)
+            self._pending_hash_futures = still_pending
+
+    def _compute_and_store_hash(
+        self,
+        file_id: int,
+        file_path: Path,
+        file_type: str
+    ):
+        """Compute hash(es) for a file and store in the database.
+
+        Uses multi-threading if hash_workers > 1, otherwise computes synchronously.
+
+        Uses the appropriate hash strategy based on file type:
+        - Images (jpg, jpeg, gif): perceptual pHash + pixel MD5
+        - Images (png, raw, etc): pixel MD5 + perceptual pHash
+        - Videos/Audio/Documents: file MD5
+
+        Args:
+            file_id: Database ID of the file
+            file_path: Path to the file
+            file_type: File type (image, video, etc.)
+        """
+        if self._hash_workers > 1:
+            # Multi-threaded: submit job to thread pool
+            job = self._create_hash_job(file_id, file_path, file_type)
+            self._submit_hash_job(job)
+        else:
+            # Single-threaded: compute and store synchronously
+            primary_hash, secondary_hash = self.classifier.get_hash_strategy(file_path)
+
+            # Compute primary hash
+            hash_value = self._compute_hash(file_path, primary_hash, file_type)
+            if hash_value:
+                self.db.add_hash(file_id, primary_hash, hash_value)
+
+            # Compute secondary hash if defined (e.g., for images)
+            if secondary_hash:
+                hash_value = self._compute_hash(file_path, secondary_hash, file_type)
+                if hash_value:
+                    self.db.add_hash(file_id, secondary_hash, hash_value)
+
+    def _compute_hash(
+        self,
+        file_path: Path,
+        hash_type: str,
+        file_type: str
+    ) -> Optional[str]:
+        """Compute a specific type of hash for a file.
+
+        Args:
+            file_path: Path to the file
+            hash_type: Type of hash to compute (from HashType)
+            file_type: File type for context
+
+        Returns:
+            Hash value as string, or None if computation failed
+        """
+        try:
+            if hash_type == HashType.EXACT_MD5:
+                return self._compute_file_md5(file_path)
+
+            elif hash_type == HashType.PIXEL_MD5:
+                return self._compute_pixel_md5(file_path)
+
+            elif hash_type.startswith('perceptual_'):
+                # Extract algorithm name (phash, dhash, etc.)
+                algorithm = hash_type.replace('perceptual_', '')
+                phash = self._compute_perceptual_hash(file_path, algorithm)
+                # Convert ImageHash to string for storage
+                return str(phash) if phash else None
+
+            else:
+                # Unknown hash type, fall back to file MD5
+                return self._compute_file_md5(file_path)
+
+        except Exception:
+            return None
+
+    def _compute_file_md5(self, file_path: Path, chunk_size: int = 65536) -> Optional[str]:
+        """Compute MD5 hash of entire file.
+
+        Args:
+            file_path: Path to the file
+            chunk_size: Size of chunks to read
+
+        Returns:
+            MD5 hex digest or None if failed
+        """
+        import hashlib
+        try:
+            hasher = hashlib.md5()
+            with open(file_path, 'rb') as f:
+                for chunk in iter(lambda: f.read(chunk_size), b''):
+                    hasher.update(chunk)
+            return hasher.hexdigest()
+        except (IOError, OSError):
+            return None
+
+    def _compute_pixel_md5(self, file_path: Path) -> Optional[str]:
+        """Compute MD5 hash of image pixel data (ignores EXIF metadata).
+
+        Args:
+            file_path: Path to the image file
+
+        Returns:
+            MD5 hex digest or None if failed
+        """
+        import hashlib
+        try:
+            ext = file_path.suffix.lower()
+
+            # Handle RAW files with rawpy
+            if ext in ('.cr2', '.crw', '.cr3', '.raf', '.raw', '.nef', '.arw', '.orf', '.dng'):
+                try:
+                    import rawpy
+                    with rawpy.imread(str(file_path)) as raw:
+                        rgb = raw.postprocess()
+                        hasher = hashlib.md5()
+                        hasher.update(rgb.tobytes())
+                        return hasher.hexdigest()
+                except Exception:
+                    # Fall back to file hash
+                    return self._compute_file_md5(file_path)
+
+            # Standard image formats with PIL
+            from PIL import Image
+            # Suppress decompression bomb warnings for large but legitimate images
+            with warnings.catch_warnings():
+                warnings.filterwarnings('ignore', category=Image.DecompressionBombWarning)
+                with Image.open(file_path) as img:
+                    if img.mode != 'RGB':
+                        img = img.convert('RGB')
+                    pixel_data = img.tobytes()
+                    hasher = hashlib.md5()
+                    hasher.update(pixel_data)
+                    return hasher.hexdigest()
+
+        except Exception:
+            # Fall back to file hash
+            return self._compute_file_md5(file_path)
+
+    def _compute_perceptual_hash(
+        self,
+        file_path: Path,
+        algorithm: str = "phash"
+    ) -> Optional['imagehash.ImageHash']:
+        """Compute perceptual hash of an image.
+
+        Args:
+            file_path: Path to the image file
+            algorithm: Hash algorithm (phash, dhash, ahash, whash)
+
+        Returns:
+            ImageHash object or None if failed
+        """
+        try:
+            import imagehash
+            from PIL import Image, ImageOps
+
+            # Select hash function
+            hash_functions = {
+                'phash': imagehash.phash,
+                'dhash': imagehash.dhash,
+                'ahash': imagehash.average_hash,
+                'whash': imagehash.whash,
+            }
+            hash_func = hash_functions.get(algorithm, imagehash.phash)
+
+            ext = file_path.suffix.lower()
+
+            # Handle RAW files
+            if ext in ('.cr2', '.crw', '.cr3', '.raf', '.raw', '.nef', '.arw', '.orf', '.dng'):
+                try:
+                    import rawpy
+                    with rawpy.imread(str(file_path)) as raw:
+                        rgb = raw.postprocess()
+                        img = Image.fromarray(rgb)
+                        return hash_func(img)
+                except Exception:
+                    return None
+
+            # Standard images - suppress decompression bomb warnings for large images
+            with warnings.catch_warnings():
+                warnings.filterwarnings('ignore', category=Image.DecompressionBombWarning)
+                with Image.open(file_path) as img:
+                    # Apply EXIF orientation correction
+                    img = ImageOps.exif_transpose(img)
+                    return hash_func(img)
+
+        except Exception:
+            return None

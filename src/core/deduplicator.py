@@ -856,3 +856,217 @@ class Deduplicator:
             progress_callback("Complete", total_prefixes, total_prefixes)
 
         return all_groups
+
+    def find_duplicates_from_db(
+        self,
+        volume_ids: Optional[List[int]] = None,
+        hash_type: str = "exact_md5",
+        progress_callback: Optional[Callable[[str, int, int], None]] = None
+    ) -> List[DuplicateGroup]:
+        """Find duplicates by querying the database for matching hashes.
+
+        This method queries pre-computed hashes from the database rather than
+        re-hashing files, making it much faster for volumes that have been scanned.
+
+        Args:
+            volume_ids: Optional list of volume IDs to search (None = all volumes)
+            hash_type: Type of hash to use for matching (default: exact_md5)
+            progress_callback: Optional callback(status, current, total)
+
+        Returns:
+            List of DuplicateGroup objects
+        """
+        from .database import DatabaseManager
+
+        db = DatabaseManager.get_instance()
+        self._cancelled = False
+
+        if progress_callback:
+            progress_callback("Finding duplicate hashes...", 0, 0)
+
+        # Find all hash values that appear more than once
+        duplicate_hashes = db.find_duplicate_hashes(hash_type, volume_ids)
+
+        if not duplicate_hashes:
+            return []
+
+        all_groups: List[DuplicateGroup] = []
+        group_id = 0
+        total_hashes = len(duplicate_hashes)
+
+        for i, (hash_value, count) in enumerate(duplicate_hashes):
+            if self._cancelled:
+                break
+
+            if progress_callback:
+                progress_callback(
+                    f"Processing hash {i+1}/{total_hashes}",
+                    i, total_hashes
+                )
+
+            # Get all files with this hash
+            files = db.find_files_by_hash(hash_type, hash_value)
+
+            if len(files) < 2:
+                continue
+
+            # Convert DB records to ImageFile objects for compatibility
+            image_list = []
+            for f in files:
+                # Get the volume info to construct full path
+                vol = db.get_volume_by_id(f['volume_id'])
+                if not vol:
+                    continue
+
+                mount_point = vol.get('mount_point', '')
+                full_path = Path(mount_point) / f['relative_path']
+
+                # Create ImageFile for compatibility with existing UI
+                img = ImageFile(
+                    path=full_path,
+                    filename=f['filename'],
+                    extension=f.get('extension', ''),
+                    size_bytes=f['file_size_bytes'],
+                    width=f.get('width'),
+                    height=f.get('height'),
+                    created_at=f.get('file_created_at'),
+                    modified_at=f.get('file_modified_at'),
+                )
+                # Store DB info for reference
+                img.db_file_id = f['id']
+                img.db_volume_id = f['volume_id']
+                img.volume_name = vol.get('name', 'Unknown')
+                image_list.append(img)
+
+            if len(image_list) < 2:
+                continue
+
+            # Create similarity scores (all 1.0 for exact matches)
+            group_scores = {}
+            paths = [str(img.path) for img in image_list]
+            for j, p1 in enumerate(paths):
+                for p2 in paths[j+1:]:
+                    key = tuple(sorted([p1, p2]))
+                    group_scores[key] = 1.0
+
+            group = DuplicateGroup(
+                group_id=group_id,
+                images=image_list,
+                similarity_scores=group_scores
+            )
+            all_groups.append(group)
+            group_id += 1
+
+        if progress_callback:
+            progress_callback("Complete", total_hashes, total_hashes)
+
+        return all_groups
+
+    def find_cross_volume_duplicates(
+        self,
+        volume_ids: List[int],
+        hash_type: str = "exact_md5",
+        progress_callback: Optional[Callable[[str, int, int], None]] = None
+    ) -> List[DuplicateGroup]:
+        """Find duplicates that exist across multiple volumes.
+
+        This specifically finds files that have copies on different drives,
+        useful for consolidating backups or finding redundant copies.
+
+        Args:
+            volume_ids: List of volume IDs to search across
+            hash_type: Type of hash to use for matching
+            progress_callback: Optional callback(status, current, total)
+
+        Returns:
+            List of DuplicateGroup objects where files span multiple volumes
+        """
+        from .database import DatabaseManager
+
+        db = DatabaseManager.get_instance()
+        self._cancelled = False
+
+        if progress_callback:
+            progress_callback("Finding cross-drive duplicates...", 0, 0)
+
+        # Find all duplicates across the specified volumes
+        duplicate_hashes = db.find_duplicate_hashes(hash_type, volume_ids)
+
+        if not duplicate_hashes:
+            return []
+
+        all_groups: List[DuplicateGroup] = []
+        group_id = 0
+        total_hashes = len(duplicate_hashes)
+
+        for i, (hash_value, count) in enumerate(duplicate_hashes):
+            if self._cancelled:
+                break
+
+            if progress_callback:
+                progress_callback(
+                    f"Processing hash {i+1}/{total_hashes}",
+                    i, total_hashes
+                )
+
+            # Get all files with this hash
+            files = db.find_files_by_hash(hash_type, hash_value)
+
+            if len(files) < 2:
+                continue
+
+            # Check if files span multiple volumes
+            volume_set = set(f['volume_id'] for f in files)
+            if len(volume_set) < 2:
+                # All files on same volume - not a cross-volume duplicate
+                continue
+
+            # Convert DB records to ImageFile objects
+            image_list = []
+            for f in files:
+                vol = db.get_volume_by_id(f['volume_id'])
+                if not vol:
+                    continue
+
+                mount_point = vol.get('mount_point', '')
+                full_path = Path(mount_point) / f['relative_path']
+
+                img = ImageFile(
+                    path=full_path,
+                    filename=f['filename'],
+                    extension=f.get('extension', ''),
+                    size_bytes=f['file_size_bytes'],
+                    width=f.get('width'),
+                    height=f.get('height'),
+                    created_at=f.get('file_created_at'),
+                    modified_at=f.get('file_modified_at'),
+                )
+                img.db_file_id = f['id']
+                img.db_volume_id = f['volume_id']
+                img.volume_name = vol.get('name', 'Unknown')
+                image_list.append(img)
+
+            if len(image_list) < 2:
+                continue
+
+            # Create similarity scores
+            group_scores = {}
+            paths = [str(img.path) for img in image_list]
+            for j, p1 in enumerate(paths):
+                for p2 in paths[j+1:]:
+                    key = tuple(sorted([p1, p2]))
+                    group_scores[key] = 1.0
+
+            group = DuplicateGroup(
+                group_id=group_id,
+                images=image_list,
+                similarity_scores=group_scores
+            )
+            group.is_cross_volume = True
+            all_groups.append(group)
+            group_id += 1
+
+        if progress_callback:
+            progress_callback("Complete", total_hashes, total_hashes)
+
+        return all_groups

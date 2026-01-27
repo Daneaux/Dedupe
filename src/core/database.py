@@ -124,6 +124,35 @@ CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON scan_checkpoints(session_i
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER PRIMARY KEY
 );
+
+-- Custom file type extensions (user preferences)
+CREATE TABLE IF NOT EXISTS custom_extensions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    extension TEXT NOT NULL UNIQUE,
+    action TEXT NOT NULL,  -- 'include' or 'exclude'
+    added_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_custom_extensions_action ON custom_extensions(action);
+
+-- Unknown file extensions encountered during scanning
+CREATE TABLE IF NOT EXISTS unknown_extensions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    extension TEXT NOT NULL UNIQUE,
+    occurrence_count INTEGER DEFAULT 1,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL
+);
+
+-- Excluded paths per volume (directories to skip during scanning)
+CREATE TABLE IF NOT EXISTS excluded_paths (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    volume_id INTEGER NOT NULL,
+    relative_path TEXT NOT NULL,  -- Path relative to volume mount point
+    added_at TEXT NOT NULL,
+    FOREIGN KEY (volume_id) REFERENCES volumes(id) ON DELETE CASCADE,
+    UNIQUE(volume_id, relative_path)
+);
+CREATE INDEX IF NOT EXISTS idx_excluded_paths_volume ON excluded_paths(volume_id);
 """
 
 
@@ -808,3 +837,218 @@ class DatabaseManager:
                 ORDER BY ss.started_at DESC
             """)
             return [dict(row) for row in cursor.fetchall()]
+
+    # ==================== Custom Extension Operations ====================
+
+    def get_custom_included_extensions(self) -> List[str]:
+        """Get list of custom included extensions."""
+        with self.cursor() as cursor:
+            cursor.execute(
+                "SELECT extension FROM custom_extensions WHERE action = 'include'"
+            )
+            return [row[0] for row in cursor.fetchall()]
+
+    def get_custom_excluded_extensions(self) -> List[str]:
+        """Get list of custom excluded extensions."""
+        with self.cursor() as cursor:
+            cursor.execute(
+                "SELECT extension FROM custom_extensions WHERE action = 'exclude'"
+            )
+            return [row[0] for row in cursor.fetchall()]
+
+    def set_custom_included_extensions(self, extensions: List[str]):
+        """Set the custom included extensions (replaces existing)."""
+        now = datetime.now().isoformat()
+
+        with self.cursor() as cursor:
+            # Remove existing includes
+            cursor.execute("DELETE FROM custom_extensions WHERE action = 'include'")
+
+            # Insert new includes
+            for ext in extensions:
+                cursor.execute("""
+                    INSERT OR REPLACE INTO custom_extensions (extension, action, added_at)
+                    VALUES (?, 'include', ?)
+                """, (ext.lower(), now))
+
+    def set_custom_excluded_extensions(self, extensions: List[str]):
+        """Set the custom excluded extensions (replaces existing)."""
+        now = datetime.now().isoformat()
+
+        with self.cursor() as cursor:
+            # Remove existing excludes
+            cursor.execute("DELETE FROM custom_extensions WHERE action = 'exclude'")
+
+            # Insert new excludes
+            for ext in extensions:
+                cursor.execute("""
+                    INSERT OR REPLACE INTO custom_extensions (extension, action, added_at)
+                    VALUES (?, 'exclude', ?)
+                """, (ext.lower(), now))
+
+    def clear_custom_extensions(self):
+        """Clear all custom extension settings."""
+        with self.cursor() as cursor:
+            cursor.execute("DELETE FROM custom_extensions")
+
+    # ==================== Unknown Extension Operations ====================
+
+    def add_unknown_extension(self, extension: str):
+        """Add or increment count for an unknown extension."""
+        now = datetime.now().isoformat()
+        ext = extension.lower()
+
+        with self.cursor() as cursor:
+            # Try to update existing
+            cursor.execute("""
+                UPDATE unknown_extensions
+                SET occurrence_count = occurrence_count + 1, last_seen_at = ?
+                WHERE extension = ?
+            """, (now, ext))
+
+            if cursor.rowcount == 0:
+                # Insert new
+                cursor.execute("""
+                    INSERT INTO unknown_extensions
+                    (extension, occurrence_count, first_seen_at, last_seen_at)
+                    VALUES (?, 1, ?, ?)
+                """, (ext, now, now))
+
+    def get_unknown_extensions(self) -> Dict[str, int]:
+        """Get all unknown extensions with their occurrence counts."""
+        with self.cursor() as cursor:
+            cursor.execute(
+                "SELECT extension, occurrence_count FROM unknown_extensions"
+            )
+            return {row[0]: row[1] for row in cursor.fetchall()}
+
+    def update_unknown_extensions(self, remaining: set):
+        """Update unknown extensions table to only keep specified extensions."""
+        with self.cursor() as cursor:
+            if not remaining:
+                cursor.execute("DELETE FROM unknown_extensions")
+            else:
+                # Delete extensions not in the remaining set
+                placeholders = ",".join("?" * len(remaining))
+                cursor.execute(f"""
+                    DELETE FROM unknown_extensions
+                    WHERE extension NOT IN ({placeholders})
+                """, list(remaining))
+
+    def clear_unknown_extensions(self):
+        """Clear all unknown extensions."""
+        with self.cursor() as cursor:
+            cursor.execute("DELETE FROM unknown_extensions")
+
+    def get_extension_counts(self) -> Dict[str, int]:
+        """Get counts of files by extension from the files table."""
+        with self.cursor() as cursor:
+            cursor.execute("""
+                SELECT extension, COUNT(*) as cnt
+                FROM files
+                WHERE is_deleted = 0 AND extension IS NOT NULL AND extension != ''
+                GROUP BY extension
+            """)
+            return {row[0]: row[1] for row in cursor.fetchall()}
+
+    def get_directories_by_extension(self, extension: str) -> List[Dict[str, Any]]:
+        """Get all directories containing files with a specific extension.
+
+        Returns list of dicts with 'directory', 'volume_id', 'volume_name',
+        'mount_point', and 'file_count' keys.
+        """
+        ext = extension.lower().lstrip('.')
+
+        with self.cursor() as cursor:
+            cursor.execute("""
+                SELECT
+                    CASE
+                        WHEN INSTR(f.relative_path, '/') > 0
+                        THEN SUBSTR(f.relative_path, 1, LENGTH(f.relative_path) - LENGTH(f.filename) - 1)
+                        ELSE ''
+                    END as directory,
+                    f.volume_id,
+                    v.name as volume_name,
+                    v.mount_point,
+                    COUNT(*) as file_count
+                FROM files f
+                JOIN volumes v ON f.volume_id = v.id
+                WHERE f.extension = ? AND f.is_deleted = 0
+                GROUP BY directory, f.volume_id
+                ORDER BY file_count DESC, directory ASC
+            """, (ext,))
+
+            results = []
+            for row in cursor.fetchall():
+                results.append({
+                    'directory': row[0] or '/',
+                    'volume_id': row[1],
+                    'volume_name': row[2],
+                    'mount_point': row[3],
+                    'file_count': row[4]
+                })
+            return results
+
+    # ==================== Excluded Paths Operations ====================
+
+    def add_excluded_path(self, volume_id: int, relative_path: str) -> bool:
+        """Add an excluded path for a volume.
+
+        Args:
+            volume_id: The volume ID
+            relative_path: Path relative to volume mount point (e.g., 'Users/foo/bar')
+
+        Returns:
+            True if added, False if already exists
+        """
+        now = datetime.now().isoformat()
+        # Normalize path: remove leading/trailing slashes
+        normalized = relative_path.strip('/')
+
+        with self.cursor() as cursor:
+            try:
+                cursor.execute("""
+                    INSERT INTO excluded_paths (volume_id, relative_path, added_at)
+                    VALUES (?, ?, ?)
+                """, (volume_id, normalized, now))
+                return True
+            except sqlite3.IntegrityError:
+                # Already exists
+                return False
+
+    def remove_excluded_path(self, volume_id: int, relative_path: str) -> bool:
+        """Remove an excluded path for a volume.
+
+        Returns:
+            True if removed, False if not found
+        """
+        normalized = relative_path.strip('/')
+
+        with self.cursor() as cursor:
+            cursor.execute("""
+                DELETE FROM excluded_paths
+                WHERE volume_id = ? AND relative_path = ?
+            """, (volume_id, normalized))
+            return cursor.rowcount > 0
+
+    def get_excluded_paths(self, volume_id: int) -> List[str]:
+        """Get all excluded paths for a volume.
+
+        Returns:
+            List of relative paths (e.g., ['Users/foo/bar', 'Library/Caches'])
+        """
+        with self.cursor() as cursor:
+            cursor.execute("""
+                SELECT relative_path FROM excluded_paths
+                WHERE volume_id = ?
+                ORDER BY relative_path
+            """, (volume_id,))
+            return [row[0] for row in cursor.fetchall()]
+
+    def clear_excluded_paths(self, volume_id: int):
+        """Clear all excluded paths for a volume."""
+        with self.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM excluded_paths WHERE volume_id = ?",
+                (volume_id,)
+            )

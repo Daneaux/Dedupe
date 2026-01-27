@@ -15,6 +15,7 @@ from PyQt6.QtGui import QFont
 from ..core.database import DatabaseManager
 from ..core.volume_manager import VolumeManager, VolumeInfo
 from ..core.file_scanner import FileScanner, ScanStats
+from .file_types_manager import FileTypesManagerDialog
 
 
 class DriveItemWidget(QWidget):
@@ -252,6 +253,11 @@ class DriveManagerDialog(QDialog):
         self.refresh_button = QPushButton("🔄 Refresh")
         self.refresh_button.clicked.connect(self.refresh_drives)
         action_row1.addWidget(self.refresh_button)
+
+        self.file_types_button = QPushButton("⚙ File Types")
+        self.file_types_button.setToolTip("Manage which file types to include or exclude")
+        self.file_types_button.clicked.connect(self._open_file_types_manager)
+        action_row1.addWidget(self.file_types_button)
 
         action_row1.addStretch()
 
@@ -632,3 +638,15 @@ class DriveManagerDialog(QDialog):
                 f"Found {len(resumable)} interrupted scans.\n"
                 "Select a drive and click 'Resume Scan' to continue."
             )
+
+    def _open_file_types_manager(self):
+        """Open the file types manager dialog."""
+        dialog = FileTypesManagerDialog(self)
+        dialog.settings_changed.connect(self._on_file_types_changed)
+        dialog.exec()
+
+    def _on_file_types_changed(self):
+        """Handle changes to file type settings."""
+        # Currently no action needed here, but you could refresh
+        # the UI or notify the user if necessary
+        pass

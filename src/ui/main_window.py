@@ -204,6 +204,69 @@ class ScanWorker(QThread):
         self._deduplicator.cancel()
 
 
+class DBDuplicateWorker(QThread):
+    """Worker thread for finding duplicates from database (pre-computed hashes)."""
+
+    progress = pyqtSignal(str, int, int)  # status, current, total
+    groups_found = pyqtSignal(list)  # emits groups as they're found
+    finished = pyqtSignal()  # signals completion
+    error = pyqtSignal(str)
+
+    def __init__(
+        self,
+        volume_ids: List[int],
+        cross_volume: bool = False,
+        hash_type: str = "exact_md5",
+        parent=None
+    ):
+        """Initialize the DB duplicate worker.
+
+        Args:
+            volume_ids: List of volume IDs to search
+            cross_volume: If True, only find duplicates spanning multiple volumes
+            hash_type: Type of hash to use for matching
+        """
+        super().__init__(parent)
+        self.volume_ids = volume_ids
+        self.cross_volume = cross_volume
+        self.hash_type = hash_type
+        self._cancelled = False
+
+    def run(self):
+        """Find duplicates from pre-computed hashes in database."""
+        try:
+            self._cancelled = False
+            deduplicator = Deduplicator()
+
+            def progress_callback(status: str, current: int, total: int):
+                self.progress.emit(status, current, total)
+
+            if self.cross_volume:
+                groups = deduplicator.find_cross_volume_duplicates(
+                    volume_ids=self.volume_ids,
+                    hash_type=self.hash_type,
+                    progress_callback=progress_callback
+                )
+            else:
+                groups = deduplicator.find_duplicates_from_db(
+                    volume_ids=self.volume_ids,
+                    hash_type=self.hash_type,
+                    progress_callback=progress_callback
+                )
+
+            if groups:
+                self.groups_found.emit(groups)
+
+            self.finished.emit()
+
+        except Exception as e:
+            self.error.emit(str(e))
+
+    def cancel(self):
+        """Cancel the operation."""
+        self._cancelled = True
+
+
 class MainWindow(QMainWindow):
     """Main application window."""
 
@@ -215,6 +278,7 @@ class MainWindow(QMainWindow):
         self._groups: List[DuplicateGroup] = []
         self._root_dir: Optional[Path] = None
         self._worker: Optional[ScanWorker] = None
+        self._db_worker: Optional[DBDuplicateWorker] = None
         self._scan_mode: str = ScanMode.INTRA_DIRECTORY
         self._detection_mode: str = DetectionMode.EXACT
         self._perceptual_threshold: int = 10  # Default sensitivity (0=strict, 20=loose)
@@ -1189,6 +1253,7 @@ class MainWindow(QMainWindow):
         """Load and find duplicates for a specific volume.
 
         This is called from the drive manager when user selects 'Find Duplicates'.
+        Uses pre-computed hashes from the database for fast duplicate detection.
         """
         from ..core.database import DatabaseManager
 
@@ -1209,51 +1274,124 @@ class MainWindow(QMainWindow):
             self.dir_selector.set_directory(mount_point)
             self._root_dir = Path(mount_point)
 
-        # Update status
+        volume_id = vol.get('id')
         file_count = vol.get('file_count', 0)
-        self.status_bar.showMessage(
-            f"Volume: {vol.get('name')} - {file_count:,} files indexed. "
-            "Click 'Scan for Duplicates' to find duplicates."
-        )
+
+        # Check if volume has been scanned
+        if file_count == 0:
+            QMessageBox.information(
+                self,
+                "Volume Not Scanned",
+                f"'{vol.get('name')}' hasn't been scanned yet.\n\n"
+                "Please scan the volume first to index files."
+            )
+            return
+
+        # Clear previous results
+        self._groups = []
+        self.results_view.clear()
+        self.preview_panel.clear()
+
+        # Show progress
+        self.progress_panel.start(f"Finding duplicates in {vol.get('name')}...")
+        self.scan_button.setEnabled(False)
+
+        # Create worker for finding duplicates
+        self._db_worker = DBDuplicateWorker([volume_id], cross_volume=False)
+        self._db_worker.progress.connect(self._on_progress)
+        self._db_worker.groups_found.connect(self._on_groups_found)
+        self._db_worker.finished.connect(self._on_db_scan_finished)
+        self._db_worker.error.connect(self._on_scan_error)
+        self._db_worker.start()
 
     def load_cross_drive_duplicates(self, volume_uuids: list):
         """Load and find duplicates across multiple volumes.
 
         This is called from the drive manager for cross-drive duplicate detection.
+        Finds files that exist on multiple drives (not duplicates within same drive).
         """
         from ..core.database import DatabaseManager
 
         db = DatabaseManager.get_instance()
 
-        # Get volume names for display
+        # Get volume IDs and names for display
+        volume_ids = []
         vol_names = []
         for uuid in volume_uuids:
             vol = db.get_volume_by_uuid(uuid)
             if vol:
+                volume_ids.append(vol.get('id'))
                 vol_names.append(vol.get('name', 'Unknown'))
 
-        self.status_bar.showMessage(
-            f"Cross-drive mode: {', '.join(vol_names)}. "
-            "Finding duplicates across all indexed drives..."
-        )
+        if len(volume_ids) < 2:
+            QMessageBox.warning(
+                self,
+                "Insufficient Volumes",
+                "Need at least 2 indexed volumes for cross-drive duplicate detection."
+            )
+            return
 
-        # TODO: Implement cross-drive duplicate detection
-        # This would query the database for files with matching hashes
-        # across different volumes
+        # Clear previous results
+        self._groups = []
+        self.results_view.clear()
+        self.preview_panel.clear()
+        self._root_dir = None
+
+        # Show progress
+        self.progress_panel.start(f"Finding cross-drive duplicates across {', '.join(vol_names)}...")
+        self.scan_button.setEnabled(False)
+
+        # Create worker for finding cross-volume duplicates
+        self._db_worker = DBDuplicateWorker(volume_ids, cross_volume=True)
+        self._db_worker.progress.connect(self._on_progress)
+        self._db_worker.groups_found.connect(self._on_groups_found)
+        self._db_worker.finished.connect(self._on_db_scan_finished)
+        self._db_worker.error.connect(self._on_scan_error)
+        self._db_worker.start()
+
+    def _on_db_scan_finished(self):
+        """Handle completion of database-backed duplicate detection."""
+        self._db_worker = None
+
+        # Update UI
+        self.progress_panel.finish(f"Found {len(self._groups)} duplicate groups")
+        self.scan_button.setEnabled(True)
+
+        if self._groups:
+            total_files = sum(len(g) for g in self._groups)
+            savings = sum(g.potential_savings for g in self._groups)
+            self.status_bar.showMessage(
+                f"Complete: {len(self._groups)} groups with {total_files} files. "
+                f"Potential savings: {self._format_size(savings)}"
+            )
+
+            # Enable action buttons
+            self.move_button.setEnabled(True)
+            self.delete_button.setEnabled(True)
+            self.export_button.setEnabled(True)
+        else:
+            self.status_bar.showMessage("No duplicates found")
 
     def closeEvent(self, event):
         """Handle window close."""
+        # Check for running workers
+        running_worker = None
         if self._worker and self._worker.isRunning():
+            running_worker = self._worker
+        elif self._db_worker and self._db_worker.isRunning():
+            running_worker = self._db_worker
+
+        if running_worker:
             reply = QMessageBox.question(
                 self,
-                "Scan in Progress",
-                "A scan is currently running. Cancel and exit?",
+                "Operation in Progress",
+                "An operation is currently running. Cancel and exit?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
 
             if reply == QMessageBox.StandardButton.Yes:
-                self._worker.cancel()
-                self._worker.wait()
+                running_worker.cancel()
+                running_worker.wait()
                 event.accept()
             else:
                 event.ignore()
