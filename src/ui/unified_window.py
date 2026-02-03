@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
     QFileDialog, QProgressDialog, QMessageBox, QSplitter,
     QGroupBox, QRadioButton, QButtonGroup, QComboBox, QTreeWidget,
     QTreeWidgetItem, QHeaderView, QAbstractItemView, QSizePolicy,
-    QDialog, QDialogButtonBox
+    QDialog, QDialogButtonBox, QApplication
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QThread
 from PyQt6.QtGui import QFont, QBrush, QColor, QCursor
@@ -23,6 +23,7 @@ from ..core.volume_manager import VolumeManager, VolumeInfo
 from ..core.file_scanner import FileScanner, ScanStats
 from ..core.deduplicator import Deduplicator
 from ..models.duplicate_group import DuplicateGroup
+from .duplicate_group_viewer import DuplicateGroupViewerDialog
 
 
 # ============================================================================
@@ -994,6 +995,14 @@ class FileTypesTab(QWidget):
         self.reset_btn.clicked.connect(self._reset_to_defaults)
         btn_row.addWidget(self.reset_btn)
 
+        self.collect_dirs_btn = QPushButton("Collect Directory Info")
+        self.collect_dirs_btn.setToolTip(
+            "Quick scan to find where unknown/excluded file types are located.\n"
+            "This lets you see directories when double-clicking on those extensions."
+        )
+        self.collect_dirs_btn.clicked.connect(self._collect_directory_info)
+        btn_row.addWidget(self.collect_dirs_btn)
+
         btn_row.addStretch()
 
         self.save_btn = QPushButton("Save Changes")
@@ -1325,6 +1334,162 @@ class FileTypesTab(QWidget):
         self.settings_changed.emit()
         QMessageBox.information(self, "Saved", "File type settings saved.")
 
+    def _collect_directory_info(self):
+        """Collect directory info for unknown/excluded extensions."""
+        from .drives_tab_dialogs import VolumeSelectDialog
+
+        # Get list of indexed volumes
+        volumes = self.db.get_all_volumes()
+        if not volumes:
+            QMessageBox.information(
+                self,
+                "No Volumes",
+                "No volumes have been scanned yet.\n\n"
+                "Go to the Drives tab and scan a drive first."
+            )
+            return
+
+        # Let user select which volume to scan
+        volume_names = [f"{v['name']} ({v.get('file_count', 0):,} files)" for v in volumes]
+        volume_ids = [v['id'] for v in volumes]
+
+        from PyQt6.QtWidgets import QInputDialog
+        selected, ok = QInputDialog.getItem(
+            self,
+            "Select Volume",
+            "Select a volume to collect directory info for unknown/excluded extensions:",
+            volume_names,
+            0,
+            False
+        )
+
+        if not ok:
+            return
+
+        selected_idx = volume_names.index(selected)
+        volume_id = volume_ids[selected_idx]
+        volume = volumes[selected_idx]
+
+        # Get volume info
+        from ..core.volume_manager import VolumeManager, VolumeInfo
+        volume_manager = VolumeManager()
+
+        mount_point = Path(volume['mount_point'])
+        if not mount_point.exists():
+            QMessageBox.warning(
+                self,
+                "Volume Not Available",
+                f"The volume '{volume['name']}' is not currently mounted at:\n{mount_point}"
+            )
+            return
+
+        # Create VolumeInfo
+        vol_info = VolumeInfo(
+            uuid=volume['uuid'],
+            name=volume['name'],
+            mount_point=mount_point,
+            is_internal=True,
+            total_bytes=volume.get('total_bytes', 0) or 0,
+            available_bytes=0,
+            filesystem=volume.get('filesystem', 'unknown') or 'unknown',
+        )
+
+        # Create progress dialog
+        progress = QProgressDialog(
+            "Collecting directory info for unknown/excluded extensions...",
+            "Cancel",
+            0, 100,
+            self
+        )
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        # Run the scan in a worker thread
+        self._dir_scan_worker = DirectoryScanWorker(vol_info)
+
+        def on_progress(status, current, total):
+            if total > 0:
+                progress.setValue(int((current / total) * 100))
+            progress.setLabelText(f"{status}\n{current:,} / {total:,} files")
+
+        def on_finished(counts):
+            progress.close()
+            self._dir_scan_worker = None
+
+            total_exts = len(counts)
+            total_files = sum(counts.values())
+
+            if total_exts > 0:
+                QMessageBox.information(
+                    self,
+                    "Collection Complete",
+                    f"Found {total_exts} unknown/excluded extension types "
+                    f"across {total_files:,} files.\n\n"
+                    "You can now double-click on extensions in the Unknown or Excluded "
+                    "lists to see which directories contain them."
+                )
+            else:
+                QMessageBox.information(
+                    self,
+                    "Collection Complete",
+                    "No unknown/excluded file types were found on this volume."
+                )
+
+            # Refresh the display
+            self._load_data()
+
+        def on_error(error):
+            progress.close()
+            self._dir_scan_worker = None
+            QMessageBox.critical(self, "Error", f"Error collecting directory info:\n\n{error}")
+
+        self._dir_scan_worker.progress.connect(on_progress)
+        self._dir_scan_worker.finished.connect(on_finished)
+        self._dir_scan_worker.error.connect(on_error)
+        progress.canceled.connect(lambda: self._dir_scan_worker.cancel() if self._dir_scan_worker else None)
+
+        self._dir_scan_worker.start()
+
+
+class DirectoryScanWorker(QThread):
+    """Worker thread for collecting directory info."""
+
+    progress = pyqtSignal(str, int, int)
+    finished = pyqtSignal(dict)  # Dict of extension -> count
+    error = pyqtSignal(str)
+
+    def __init__(self, volume_info, parent=None):
+        super().__init__(parent)
+        self.volume_info = volume_info
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        try:
+            from ..core.file_scanner import FileScanner
+
+            scanner = FileScanner()
+            scanner._cancelled = False
+
+            def progress_cb(status, current, total):
+                if self._cancelled:
+                    scanner._cancelled = True
+                self.progress.emit(status, current, total)
+
+            counts = scanner.collect_extension_directories(
+                volume_info=self.volume_info,
+                progress_callback=progress_cb
+            )
+
+            if not self._cancelled:
+                self.finished.emit(counts)
+
+        except Exception as e:
+            self.error.emit(str(e))
+
 
 # ============================================================================
 # DUPLICATES TAB
@@ -1525,6 +1690,7 @@ class DuplicatesTab(QWidget):
         self.results_tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.results_tree.setAlternatingRowColors(True)
         self.results_tree.itemChanged.connect(self._on_item_changed)
+        self.results_tree.itemDoubleClicked.connect(self._on_item_double_clicked)
 
         header = self.results_tree.header()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
@@ -1579,9 +1745,12 @@ class DuplicatesTab(QWidget):
         source1_index = 0
         source2_index = 0
 
-        for i, vol in enumerate(self.db.get_all_volumes()):
-            if (vol.get('file_count') or 0) > 0:
-                name = f"{vol['name']} ({vol['file_count']:,} files)"
+        volumes = self.db.get_all_volumes()
+
+        for i, vol in enumerate(volumes):
+            file_count = vol.get('file_count') or 0
+            if file_count > 0:
+                name = f"{vol['name']} ({file_count:,} files)"
                 self.source1_combo.addItem(name, vol['id'])
                 self.source2_combo.addItem(name, vol['id'])
 
@@ -1758,6 +1927,68 @@ class DuplicatesTab(QWidget):
 
         self._update_selection_count()
 
+    def _on_item_double_clicked(self, item: QTreeWidgetItem, column: int):
+        """Handle double-click to open duplicate group viewer."""
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        if not data:
+            return
+
+        item_type, item_id = data
+        group_id = None
+
+        if item_type == "group":
+            # Double-clicked on a group item
+            group_id = item_id
+        elif item_type == "file":
+            # Double-clicked on a file item - get parent group
+            parent = item.parent()
+            if parent:
+                parent_data = parent.data(0, Qt.ItemDataRole.UserRole)
+                if parent_data and parent_data[0] == "group":
+                    group_id = parent_data[1]
+
+        if group_id is not None:
+            # Find the group
+            group = next((g for g in self._groups if g.group_id == group_id), None)
+            if group:
+                dialog = DuplicateGroupViewerDialog(group, self)
+                if dialog.exec() == QDialog.DialogCode.Accepted:
+                    # Apply the selections from the dialog
+                    self._apply_dialog_selections(group_id, dialog.get_files_to_delete())
+
+    def _apply_dialog_selections(self, group_id: int, files_to_delete: list):
+        """Apply selections from the duplicate group viewer dialog to the tree."""
+        # Build set of paths to delete
+        delete_paths = {str(img.path) for img in files_to_delete}
+
+        # Find the group item in the tree
+        self.results_tree.blockSignals(True)
+
+        for i in range(self.results_tree.topLevelItemCount()):
+            group_item = self.results_tree.topLevelItem(i)
+            item_data = group_item.data(0, Qt.ItemDataRole.UserRole)
+            if item_data and item_data[0] == "group" and item_data[1] == group_id:
+                # Found the group - update all children
+                for j in range(group_item.childCount()):
+                    child = group_item.child(j)
+                    child_data = child.data(0, Qt.ItemDataRole.UserRole)
+                    if child_data and child_data[0] == "file":
+                        path = child_data[1]
+                        if path in delete_paths:
+                            child.setCheckState(0, Qt.CheckState.Checked)
+                            self._selected_for_delete.add(path)
+                            child.setText(5, "DELETE")
+                            child.setForeground(5, QBrush(QColor("red")))
+                        else:
+                            child.setCheckState(0, Qt.CheckState.Unchecked)
+                            self._selected_for_delete.discard(path)
+                            child.setText(5, "KEEP")
+                            child.setForeground(5, QBrush(QColor("green")))
+                break
+
+        self.results_tree.blockSignals(False)
+        self._update_selection_count()
+
     def _select_suggested(self):
         """Select all suggested deletes."""
         self.results_tree.blockSignals(True)
@@ -1858,6 +2089,650 @@ class DuplicatesTab(QWidget):
 
 
 # ============================================================================
+# SET OPERATIONS TAB
+# ============================================================================
+
+class SetOperationsTab(QWidget):
+    """Tab for set operations (difference, intersection) on volumes."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.db = DatabaseManager.get_instance()
+        self.volume_manager = VolumeManager()
+        self._results: List[Dict] = []
+        self._selected_paths: Set[str] = set()
+        self._is_intersection_mode: bool = False
+        # Column headers for different modes
+        self._diff_headers = ["Name", "Size", "Type", "Volume", "Path"]
+        self._intersect_headers = ["Name", "Size", "Type", "Volume A", "Path A", "Volume B", "Path B"]
+        self._setup_ui()
+        self.refresh_sources()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+        layout.setContentsMargins(16, 16, 16, 16)
+
+        # Top section: operation and source selection
+        config_frame = QFrame()
+        config_frame.setFrameStyle(QFrame.Shape.StyledPanel)
+        config_layout = QVBoxLayout(config_frame)
+
+        # Operation selection
+        op_row = QHBoxLayout()
+
+        op_label = QLabel("Operation:")
+        op_label.setStyleSheet("font-weight: bold;")
+        op_row.addWidget(op_label)
+
+        self.op_group = QButtonGroup(self)
+
+        self.diff_radio = QRadioButton("Difference (B − A): files in B not in A")
+        self.diff_radio.setChecked(True)
+        self.op_group.addButton(self.diff_radio)
+        op_row.addWidget(self.diff_radio)
+
+        self.intersect_radio = QRadioButton("Intersection (A ∩ B): files in both")
+        self.op_group.addButton(self.intersect_radio)
+        op_row.addWidget(self.intersect_radio)
+
+        op_row.addStretch()
+        config_layout.addLayout(op_row)
+
+        # Source selection row
+        sources_row = QHBoxLayout()
+
+        # Source A
+        src_a_group = QGroupBox("Source A")
+        src_a_layout = QVBoxLayout(src_a_group)
+
+        self.source_a_combo = QComboBox()
+        self.source_a_combo.setMinimumWidth(200)
+        self.source_a_combo.currentIndexChanged.connect(self._on_source_a_changed)
+        src_a_layout.addWidget(self.source_a_combo)
+
+        self.browse_a_btn = QPushButton("Filter to Folder...")
+        self.browse_a_btn.clicked.connect(lambda: self._browse_folder('a'))
+        src_a_layout.addWidget(self.browse_a_btn)
+
+        self.path_a_label = QLabel("")
+        self.path_a_label.setStyleSheet("color: #666; font-size: 11px;")
+        self.path_a_label.setWordWrap(True)
+        src_a_layout.addWidget(self.path_a_label)
+
+        self.clear_a_btn = QPushButton("Clear Filter")
+        self.clear_a_btn.clicked.connect(lambda: self._clear_path_filter('a'))
+        self.clear_a_btn.setVisible(False)
+        src_a_layout.addWidget(self.clear_a_btn)
+
+        sources_row.addWidget(src_a_group)
+
+        # Source B
+        src_b_group = QGroupBox("Source B")
+        src_b_layout = QVBoxLayout(src_b_group)
+
+        self.source_b_combo = QComboBox()
+        self.source_b_combo.setMinimumWidth(200)
+        self.source_b_combo.currentIndexChanged.connect(self._on_source_b_changed)
+        src_b_layout.addWidget(self.source_b_combo)
+
+        self.browse_b_btn = QPushButton("Filter to Folder...")
+        self.browse_b_btn.clicked.connect(lambda: self._browse_folder('b'))
+        src_b_layout.addWidget(self.browse_b_btn)
+
+        self.path_b_label = QLabel("")
+        self.path_b_label.setStyleSheet("color: #666; font-size: 11px;")
+        self.path_b_label.setWordWrap(True)
+        src_b_layout.addWidget(self.path_b_label)
+
+        self.clear_b_btn = QPushButton("Clear Filter")
+        self.clear_b_btn.clicked.connect(lambda: self._clear_path_filter('b'))
+        self.clear_b_btn.setVisible(False)
+        src_b_layout.addWidget(self.clear_b_btn)
+
+        sources_row.addWidget(src_b_group)
+
+        sources_row.addStretch()
+
+        # Options and execute button
+        options_layout = QVBoxLayout()
+
+        # Hash type selection
+        hash_row = QHBoxLayout()
+        hash_label = QLabel("Compare by:")
+        hash_row.addWidget(hash_label)
+
+        self.hash_combo = QComboBox()
+        self.hash_combo.addItem("File Hash (exact_md5)", "exact_md5")
+        self.hash_combo.addItem("Pixel Hash (pixel_md5)", "pixel_md5")
+        hash_row.addWidget(self.hash_combo)
+
+        options_layout.addLayout(hash_row)
+        options_layout.addStretch()
+
+        # Execute button
+        self.execute_btn = QPushButton("Execute Operation")
+        self.execute_btn.setStyleSheet(
+            "QPushButton { background-color: #1565c0; color: white; "
+            "padding: 12px 24px; font-size: 14px; font-weight: bold; }"
+        )
+        self.execute_btn.clicked.connect(self._execute_operation)
+        options_layout.addWidget(self.execute_btn)
+
+        sources_row.addLayout(options_layout)
+
+        config_layout.addLayout(sources_row)
+        layout.addWidget(config_frame)
+
+        # Results section
+        results_header = QHBoxLayout()
+
+        self.results_label = QLabel("Results")
+        results_font = QFont()
+        results_font.setPointSize(14)
+        results_font.setBold(True)
+        self.results_label.setFont(results_font)
+        results_header.addWidget(self.results_label)
+
+        results_header.addStretch()
+
+        self.summary_label = QLabel("Select sources and click Execute")
+        self.summary_label.setStyleSheet("color: #666;")
+        results_header.addWidget(self.summary_label)
+
+        layout.addLayout(results_header)
+
+        # Results tree
+        self.results_tree = QTreeWidget()
+        self.results_tree.setHeaderLabels(self._diff_headers)
+        self.results_tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.results_tree.setAlternatingRowColors(True)
+        self.results_tree.itemChanged.connect(self._on_item_changed)
+
+        self._configure_tree_columns()
+
+        layout.addWidget(self.results_tree, stretch=1)
+
+        # Action buttons
+        action_row = QHBoxLayout()
+
+        self.select_all_btn = QPushButton("Select All")
+        self.select_all_btn.clicked.connect(self._select_all)
+        action_row.addWidget(self.select_all_btn)
+
+        self.clear_btn = QPushButton("Clear Selection")
+        self.clear_btn.clicked.connect(self._clear_selection)
+        action_row.addWidget(self.clear_btn)
+
+        action_row.addStretch()
+
+        self.selected_label = QLabel("0 files selected")
+        action_row.addWidget(self.selected_label)
+
+        self.trash_btn = QPushButton("Move Selected to Trash")
+        self.trash_btn.setStyleSheet(
+            "QPushButton { background-color: #d32f2f; color: white; "
+            "padding: 8px 16px; font-weight: bold; }"
+        )
+        self.trash_btn.clicked.connect(self._trash_selected)
+        self.trash_btn.setEnabled(False)
+        action_row.addWidget(self.trash_btn)
+
+        layout.addLayout(action_row)
+
+    def _configure_tree_columns(self):
+        """Configure tree column sizing based on current mode."""
+        header = self.results_tree.header()
+
+        if self._is_intersection_mode:
+            # Intersection: Name, Size, Type, Volume A, Path A, Volume B, Path B
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)  # Name
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)  # Size
+            header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)  # Type
+            header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)  # Volume A
+            header.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)  # Path A
+            header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)  # Volume B
+            header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)  # Path B
+            self.results_tree.setColumnWidth(0, 200)
+            self.results_tree.setColumnWidth(4, 200)
+        else:
+            # Difference: Name, Size, Type, Volume, Path
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)  # Name
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)  # Size
+            header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)  # Type
+            header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)  # Volume
+            header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)  # Path
+            self.results_tree.setColumnWidth(0, 250)
+
+    def refresh_sources(self):
+        """Refresh source dropdowns with indexed volumes."""
+        # Save current selections
+        current_a_id = self.source_a_combo.currentData()
+        current_b_id = self.source_b_combo.currentData()
+
+        self.source_a_combo.clear()
+        self.source_b_combo.clear()
+
+        self.source_a_combo.addItem("-- Select Source A --", None)
+        self.source_b_combo.addItem("-- Select Source B --", None)
+
+        volumes = self.db.get_all_volumes()
+
+        source_a_index = 0
+        source_b_index = 0
+
+        for i, vol in enumerate(volumes):
+            file_count = vol.get('file_count') or 0
+            if file_count > 0:
+                name = f"{vol['name']} ({file_count:,} files)"
+                self.source_a_combo.addItem(name, vol['id'])
+                self.source_b_combo.addItem(name, vol['id'])
+
+                if vol['id'] == current_a_id:
+                    source_a_index = self.source_a_combo.count() - 1
+                if vol['id'] == current_b_id:
+                    source_b_index = self.source_b_combo.count() - 1
+
+        self.source_a_combo.setCurrentIndex(source_a_index)
+        self.source_b_combo.setCurrentIndex(source_b_index)
+
+    def _on_source_a_changed(self):
+        """Handle source A selection change."""
+        self._clear_path_filter('a')
+
+    def _on_source_b_changed(self):
+        """Handle source B selection change."""
+        self._clear_path_filter('b')
+
+    def _browse_folder(self, source: str):
+        """Browse for a subfolder within the selected volume."""
+        if source == 'a':
+            vol_id = self.source_a_combo.currentData()
+        else:
+            vol_id = self.source_b_combo.currentData()
+
+        if not vol_id:
+            QMessageBox.warning(
+                self, "Select Volume",
+                f"Please select Source {source.upper()} volume first."
+            )
+            return
+
+        vol = self.db.get_volume_by_id(vol_id)
+        if not vol or not vol.get('mount_point'):
+            return
+
+        mount_point = vol['mount_point']
+
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            f"Filter Source {source.upper()} to Folder",
+            mount_point
+        )
+
+        if folder:
+            # Convert to relative path
+            if folder.startswith(mount_point):
+                relative = folder[len(mount_point):].lstrip('/')
+                if source == 'a':
+                    self.path_a_label.setText(f"Filter: /{relative}" if relative else "Filter: /")
+                    self.path_a_label.setProperty("relative_path", relative)
+                    self.clear_a_btn.setVisible(True)
+                else:
+                    self.path_b_label.setText(f"Filter: /{relative}" if relative else "Filter: /")
+                    self.path_b_label.setProperty("relative_path", relative)
+                    self.clear_b_btn.setVisible(True)
+            else:
+                QMessageBox.warning(
+                    self, "Invalid Folder",
+                    "Selected folder must be within the chosen volume."
+                )
+
+    def _clear_path_filter(self, source: str):
+        """Clear the path filter for a source."""
+        if source == 'a':
+            self.path_a_label.setText("")
+            self.path_a_label.setProperty("relative_path", None)
+            self.clear_a_btn.setVisible(False)
+        else:
+            self.path_b_label.setText("")
+            self.path_b_label.setProperty("relative_path", None)
+            self.clear_b_btn.setVisible(False)
+
+    def _execute_operation(self):
+        """Execute the selected set operation."""
+        vol_a_id = self.source_a_combo.currentData()
+        vol_b_id = self.source_b_combo.currentData()
+
+        if not vol_a_id or not vol_b_id:
+            QMessageBox.warning(
+                self, "Select Sources",
+                "Please select both Source A and Source B."
+            )
+            return
+
+        if vol_a_id == vol_b_id:
+            # Same volume - check if paths are different
+            path_a = self.path_a_label.property("relative_path")
+            path_b = self.path_b_label.property("relative_path")
+            if path_a == path_b:
+                QMessageBox.warning(
+                    self, "Same Source",
+                    "Source A and Source B cannot be the same volume and path.\n"
+                    "Use 'Filter to Folder' to select different subfolders."
+                )
+                return
+
+        hash_type = self.hash_combo.currentData()
+        path_a = self.path_a_label.property("relative_path")
+        path_b = self.path_b_label.property("relative_path")
+
+        QApplication.setOverrideCursor(QCursor(Qt.CursorShape.WaitCursor))
+
+        try:
+            if self.diff_radio.isChecked():
+                self._is_intersection_mode = False
+                results = self._get_difference(vol_b_id, vol_a_id, path_b, path_a, hash_type)
+                op_desc = "in B but not in A"
+                total_size = sum(r.get('file_size_bytes', 0) for r in results)
+            else:
+                self._is_intersection_mode = True
+                results = self._get_intersection(vol_a_id, vol_b_id, path_a, path_b, hash_type)
+                op_desc = "in both A and B"
+                # For intersection, use size_a for total
+                total_size = sum(r.get('size_a', 0) for r in results)
+
+            # Update tree headers based on mode
+            if self._is_intersection_mode:
+                self.results_tree.setHeaderLabels(self._intersect_headers)
+            else:
+                self.results_tree.setHeaderLabels(self._diff_headers)
+            self._configure_tree_columns()
+
+            self._results = results
+            self._populate_results()
+
+            # Update summary
+            self.summary_label.setText(
+                f"{len(results):,} files {op_desc} ({self._format_size(total_size)})"
+            )
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error executing operation: {e}")
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def _get_difference(self, vol_b_id: int, vol_a_id: int,
+                        path_b: Optional[str], path_a: Optional[str],
+                        hash_type: str) -> List[Dict]:
+        """Get files in B that are NOT in A (set difference B - A)."""
+        with self.db.cursor() as cursor:
+            # Build the query for files in B whose hash is not in A
+            query = """
+                SELECT DISTINCT f.*, v.name as volume_name, v.mount_point
+                FROM files f
+                JOIN hashes h ON f.id = h.file_id
+                JOIN volumes v ON f.volume_id = v.id
+                WHERE f.volume_id = ? AND f.is_deleted = 0
+                  AND h.hash_type = ?
+            """
+            params = [vol_b_id, hash_type]
+
+            # Add path filter for B
+            if path_b:
+                query += " AND f.relative_path LIKE ?"
+                params.append(f"{path_b}/%")
+
+            # Exclude hashes that exist in A
+            subquery = """
+                SELECT h2.hash_value FROM hashes h2
+                JOIN files f2 ON h2.file_id = f2.id
+                WHERE f2.volume_id = ? AND f2.is_deleted = 0 AND h2.hash_type = ?
+            """
+            sub_params = [vol_a_id, hash_type]
+
+            if path_a:
+                subquery += " AND f2.relative_path LIKE ?"
+                sub_params.append(f"{path_a}/%")
+
+            query += f" AND h.hash_value NOT IN ({subquery})"
+            params.extend(sub_params)
+
+            query += " ORDER BY f.relative_path"
+
+            cursor.execute(query, params)
+            return [dict(row) for row in cursor.fetchall()]
+
+    def _get_intersection(self, vol_a_id: int, vol_b_id: int,
+                          path_a: Optional[str], path_b: Optional[str],
+                          hash_type: str) -> List[Dict]:
+        """Get paired files that exist in BOTH A and B (set intersection).
+
+        Returns results with columns for both files:
+        - filename_a, path_a, size_a, type_a, volume_a_name, mount_a
+        - filename_b, path_b, size_b, type_b, volume_b_name, mount_b
+        """
+        with self.db.cursor() as cursor:
+            # Join files from both volumes on matching hash
+            query = """
+                SELECT
+                    ha.hash_value,
+                    fa.id as file_a_id, fa.filename as filename_a, fa.relative_path as path_a,
+                    fa.file_size_bytes as size_a, fa.file_type as type_a,
+                    va.name as volume_a_name, va.mount_point as mount_a,
+                    fb.id as file_b_id, fb.filename as filename_b, fb.relative_path as path_b,
+                    fb.file_size_bytes as size_b, fb.file_type as type_b,
+                    vb.name as volume_b_name, vb.mount_point as mount_b
+                FROM hashes ha
+                JOIN files fa ON ha.file_id = fa.id
+                JOIN volumes va ON fa.volume_id = va.id
+                JOIN hashes hb ON ha.hash_value = hb.hash_value AND ha.hash_type = hb.hash_type
+                JOIN files fb ON hb.file_id = fb.id
+                JOIN volumes vb ON fb.volume_id = vb.id
+                WHERE fa.volume_id = ? AND fb.volume_id = ?
+                  AND fa.is_deleted = 0 AND fb.is_deleted = 0
+                  AND ha.hash_type = ?
+            """
+            params = [vol_a_id, vol_b_id, hash_type]
+
+            if path_a:
+                query += " AND fa.relative_path LIKE ?"
+                params.append(f"{path_a}/%")
+
+            if path_b:
+                query += " AND fb.relative_path LIKE ?"
+                params.append(f"{path_b}/%")
+
+            query += " ORDER BY fa.relative_path"
+
+            cursor.execute(query, params)
+            return [dict(row) for row in cursor.fetchall()]
+
+    def _populate_results(self):
+        """Populate the results tree with query results."""
+        self.results_tree.clear()
+        self._selected_paths.clear()
+
+        self.results_tree.blockSignals(True)
+
+        for file_info in self._results:
+            item = QTreeWidgetItem()
+
+            if self._is_intersection_mode:
+                # Intersection mode: show paired results from A and B
+                # Store path from A for selection (could also store both)
+                mount_a = file_info.get('mount_a', '')
+                full_path = str(Path(mount_a) / file_info['path_a'])
+                item.setData(0, Qt.ItemDataRole.UserRole, full_path)
+
+                # Make checkable
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(0, Qt.CheckState.Unchecked)
+
+                # Columns: Name, Size, Type, Volume A, Path A, Volume B, Path B
+                item.setText(0, file_info['filename_a'])
+                item.setText(1, self._format_size(file_info['size_a']))
+                item.setText(2, file_info.get('type_a', '-'))
+                item.setText(3, file_info.get('volume_a_name', '-'))
+
+                # Path A directory
+                path_a = file_info['path_a']
+                dir_a = str(Path(path_a).parent) if '/' in path_a else '/'
+                item.setText(4, dir_a)
+
+                item.setText(5, file_info.get('volume_b_name', '-'))
+
+                # Path B directory
+                path_b = file_info['path_b']
+                dir_b = str(Path(path_b).parent) if '/' in path_b else '/'
+                item.setText(6, dir_b)
+
+                # Store both paths for potential use
+                item.setData(1, Qt.ItemDataRole.UserRole, {
+                    'path_a': str(Path(mount_a) / file_info['path_a']),
+                    'path_b': str(Path(file_info.get('mount_b', '')) / file_info['path_b'])
+                })
+            else:
+                # Difference mode: show files from one volume
+                mount_point = file_info.get('mount_point', '')
+                full_path = str(Path(mount_point) / file_info['relative_path'])
+                item.setData(0, Qt.ItemDataRole.UserRole, full_path)
+
+                # Make checkable
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(0, Qt.CheckState.Unchecked)
+
+                # Columns: Name, Size, Type, Volume, Path
+                item.setText(0, file_info['filename'])
+                item.setText(1, self._format_size(file_info['file_size_bytes']))
+                item.setText(2, file_info.get('file_type', '-'))
+                item.setText(3, file_info.get('volume_name', '-'))
+
+                # Show relative path directory
+                rel_path = file_info['relative_path']
+                dir_path = str(Path(rel_path).parent) if '/' in rel_path else '/'
+                item.setText(4, dir_path)
+
+            self.results_tree.addTopLevelItem(item)
+
+        self.results_tree.blockSignals(False)
+        self._update_selection_count()
+
+    def _on_item_changed(self, item: QTreeWidgetItem, column: int):
+        """Handle checkbox state change."""
+        if column != 0:
+            return
+
+        path = item.data(0, Qt.ItemDataRole.UserRole)
+        if not path:
+            return
+
+        if item.checkState(0) == Qt.CheckState.Checked:
+            self._selected_paths.add(path)
+        else:
+            self._selected_paths.discard(path)
+
+        self._update_selection_count()
+
+    def _select_all(self):
+        """Select all items."""
+        self.results_tree.blockSignals(True)
+
+        for i in range(self.results_tree.topLevelItemCount()):
+            item = self.results_tree.topLevelItem(i)
+            item.setCheckState(0, Qt.CheckState.Checked)
+            path = item.data(0, Qt.ItemDataRole.UserRole)
+            if path:
+                self._selected_paths.add(path)
+
+        self.results_tree.blockSignals(False)
+        self._update_selection_count()
+
+    def _clear_selection(self):
+        """Clear all selections."""
+        self.results_tree.blockSignals(True)
+
+        for i in range(self.results_tree.topLevelItemCount()):
+            item = self.results_tree.topLevelItem(i)
+            item.setCheckState(0, Qt.CheckState.Unchecked)
+
+        self._selected_paths.clear()
+        self.results_tree.blockSignals(False)
+        self._update_selection_count()
+
+    def _update_selection_count(self):
+        """Update the selection count label."""
+        count = len(self._selected_paths)
+        total_size = 0
+
+        for file_info in self._results:
+            if self._is_intersection_mode:
+                # Intersection mode uses path_a and mount_a
+                mount_point = file_info.get('mount_a', '')
+                rel_path = file_info.get('path_a', '')
+                file_size = file_info.get('size_a', 0)
+            else:
+                # Difference mode uses relative_path and mount_point
+                mount_point = file_info.get('mount_point', '')
+                rel_path = file_info.get('relative_path', '')
+                file_size = file_info.get('file_size_bytes', 0)
+
+            full_path = str(Path(mount_point) / rel_path)
+            if full_path in self._selected_paths:
+                total_size += file_size
+
+        self.selected_label.setText(
+            f"{count} files selected ({self._format_size(total_size)})"
+        )
+        self.trash_btn.setEnabled(count > 0)
+
+    def _trash_selected(self):
+        """Move selected files to trash."""
+        if not self._selected_paths:
+            return
+
+        count = len(self._selected_paths)
+        reply = QMessageBox.question(
+            self, "Confirm Trash",
+            f"Move {count} selected files to trash?\n\nThis cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        from ..core.file_operations import move_to_trash
+
+        success = 0
+        failed = []
+
+        for path_str in list(self._selected_paths):
+            path = Path(path_str)
+            if move_to_trash(path):
+                success += 1
+                self._selected_paths.discard(path_str)
+            else:
+                failed.append(path_str)
+
+        # Re-execute to refresh results
+        self._execute_operation()
+
+        msg = f"Moved {success} files to trash."
+        if failed:
+            msg += f"\n\nFailed to move {len(failed)} files."
+
+        QMessageBox.information(self, "Complete", msg)
+
+    def _format_size(self, size: int) -> str:
+        """Format size in bytes to human readable."""
+        for unit in ["B", "KB", "MB", "GB"]:
+            if size < 1024:
+                return f"{size:.1f} {unit}"
+            size /= 1024
+        return f"{size:.1f} TB"
+
+
+# ============================================================================
 # MAIN UNIFIED WINDOW
 # ============================================================================
 
@@ -1889,16 +2764,18 @@ class UnifiedWindow(QMainWindow):
         self.drives_tab = DrivesTab()
         self.file_types_tab = FileTypesTab()
         self.duplicates_tab = DuplicatesTab()
+        self.set_ops_tab = SetOperationsTab()
 
         # Add tabs
         self.tabs.addTab(self.drives_tab, "Drives")
         self.tabs.addTab(self.file_types_tab, "File Types")
         self.tabs.addTab(self.duplicates_tab, "Duplicates")
+        self.tabs.addTab(self.set_ops_tab, "Set Operations")
 
         # Connect signals
         self.drives_tab.scan_completed.connect(self._on_scan_completed)
         self.file_types_tab.settings_changed.connect(self._on_file_types_changed)
-        self.tabs.currentChanged.connect(self._on_tab_changed)
+        # Note: removed tab change handler as it was interfering with combo boxes
 
         layout.addWidget(self.tabs)
 
@@ -1906,8 +2783,9 @@ class UnifiedWindow(QMainWindow):
         self._check_interrupted_scans()
 
     def _on_scan_completed(self):
-        """Handle scan completion - refresh duplicates tab sources."""
+        """Handle scan completion - refresh duplicates and set operations tabs."""
         self.duplicates_tab.refresh_sources()
+        self.set_ops_tab.refresh_sources()
 
     def _on_file_types_changed(self):
         """Handle file types settings change."""
@@ -1921,21 +2799,11 @@ class UnifiedWindow(QMainWindow):
             self.duplicates_tab.refresh_sources()
 
     def _check_interrupted_scans(self):
-        """Check for interrupted scans on startup."""
-        db = DatabaseManager.get_instance()
-        volume_manager = VolumeManager()
+        """Check for interrupted scans on startup.
 
-        interrupted = db.get_interrupted_scans()
-        if not interrupted:
-            return
-
-        mounted_uuids = {v.uuid for v in volume_manager.list_volumes()}
-        resumable = [s for s in interrupted if s.get('volume_uuid') in mounted_uuids]
-
-        if resumable:
-            QMessageBox.information(
-                self,
-                "Interrupted Scans Found",
-                f"Found {len(resumable)} interrupted scan(s).\n"
-                "Go to the Drives tab and click 'Resume Scan' to continue."
-            )
+        Note: No longer shows a popup. The Drives tab will show a 'Resume Scan'
+        button for any volumes with interrupted scans.
+        """
+        # Interrupted scans are handled directly in the DrivesTab UI
+        # by showing a "Resume Scan" button on affected volumes
+        pass

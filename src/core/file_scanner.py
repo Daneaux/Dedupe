@@ -966,3 +966,103 @@ class FileScanner:
 
         except Exception:
             return None
+
+    def collect_extension_directories(
+        self,
+        volume_info: VolumeInfo,
+        progress_callback: Optional[Callable[[str, int, int], None]] = None,
+        scan_path: Optional[Path] = None,
+    ) -> Dict[str, int]:
+        """Quick scan to collect directory info for unknown/excluded extensions.
+
+        This is a lightweight scan that only records where unknown/excluded
+        file types are found, without indexing files or computing hashes.
+
+        Args:
+            volume_info: Volume to scan
+            progress_callback: Optional callback(status, current, total)
+            scan_path: Optional specific path to scan (defaults to volume root)
+
+        Returns:
+            Dict mapping extension to count of files found
+        """
+        self._cancelled = False
+
+        # Register volume
+        volume_id = self.db.register_volume(
+            uuid=volume_info.uuid,
+            name=volume_info.name,
+            mount_point=str(volume_info.mount_point),
+            total_bytes=volume_info.total_bytes,
+            filesystem=volume_info.filesystem,
+        )
+
+        root_path = scan_path or volume_info.mount_point
+        volume_mount = volume_info.mount_point
+
+        # Clear existing sample paths for this volume
+        self.db.clear_extension_sample_paths(volume_id)
+
+        # Count files for progress
+        if progress_callback:
+            progress_callback("Counting files...", 0, 0)
+
+        total_files = 0
+        for _ in root_path.rglob('*'):
+            if self._cancelled:
+                break
+            total_files += 1
+
+        if self._cancelled:
+            return {}
+
+        # Scan and collect extension info
+        extension_counts: Dict[str, int] = {}
+        processed = 0
+
+        for file_path in root_path.rglob('*'):
+            if self._cancelled:
+                break
+
+            if not file_path.is_file():
+                continue
+
+            processed += 1
+
+            if progress_callback and processed % 1000 == 0:
+                progress_callback(
+                    f"Scanning: {file_path.parent.name}",
+                    processed,
+                    total_files
+                )
+
+            # Skip files in excluded directories
+            if self.file_filter and not self.file_filter.should_include_directory(file_path.parent):
+                continue
+
+            # Get file extension
+            ext = file_path.suffix.lower().lstrip('.')
+            if not ext:
+                continue
+
+            # Check if this is an unknown/excluded extension
+            file_type = self.classifier.get_file_type(file_path)
+
+            if file_type == FileType.OTHER:
+                # This is an unknown/excluded extension - record it
+                extension_counts[ext] = extension_counts.get(ext, 0) + 1
+
+                # Record the directory path
+                try:
+                    relative_path = str(file_path.relative_to(volume_mount))
+                    self.db.add_extension_sample_path(ext, volume_id, relative_path)
+                except ValueError:
+                    pass  # File not under volume mount
+
+                # Also update the unknown_extensions count
+                self.db.add_unknown_extension(ext)
+
+        if progress_callback:
+            progress_callback("Complete", total_files, total_files)
+
+        return extension_counts

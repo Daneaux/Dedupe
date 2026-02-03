@@ -1,39 +1,74 @@
-# Duplicate Image Finder
+# Dedupe - Duplicate File Finder
 
-A macOS desktop application for finding and managing exact duplicate images within directories.
+A macOS desktop application for finding and managing duplicate files across multiple drives with persistent database storage.
 
 ## Features
 
-- **Exact Duplicate Detection**: Uses MD5 file hashing to find byte-for-byte identical files
-- **Two Scan Modes**:
-  - **Intra-Directory**: Find duplicates within the same folder
-  - **Date Folder Merge**: Find duplicates across related date-prefixed folders (e.g., `01-18` and `01-18 Grace`)
+### Drive-Centric Architecture
+- **Multi-Drive Support**: Scan and index multiple drives (internal, external, network)
+- **Persistent Database**: SQLite database stores file metadata and hashes for fast re-scanning
+- **Volume Tracking**: Tracks drives by UUID so files are found even if mount points change
+- **Incremental Scans**: Only re-hashes files that have changed since last scan
+- **Resume Support**: Interrupted scans can be resumed from where they left off
+
+### Duplicate Detection
+- **Multiple Hash Types**:
+  - `pixel_md5`: MD5 of image pixel data (ignores EXIF metadata)
+  - `perceptual_phash`: Perceptual hash for finding visually similar images
+  - `exact_md5`: Full file MD5 for non-image files
+- **Cross-Drive Detection**: Find duplicates that exist on different drives
+- **Within-Drive Detection**: Find duplicates within a single drive
 - **Extension-Aware**: Only compares files of the same type (JPG vs JPG, not JPG vs RAW)
-- **Smart Keep Suggestions**:
-  - Intra-directory mode: Keeps the larger file
-  - Merge mode: Keeps the file with the shortest filename
-- **Real-Time Progress**: Shows progress as each directory is processed with incremental results
-- **Finder Integration**: Right-click to open files in Finder or view with default app
-- **Batch Operations**: Move duplicates to a separate folder or delete them
-- **Folder Merge**: Automatically merge date folders and clean up empty directories
-- **CSV Export**: Export results for external analysis
+
+### File Type Management
+- **Configurable Extensions**: Choose which file types to index
+- **Three Categories**:
+  - **Include**: File types that are indexed and checked for duplicates
+  - **Exclude**: File types that are always skipped
+  - **Unknown**: New file types encountered during scanning
+- **Directory Discovery**: See which directories contain specific file types
+- **Quick Directory Scan**: Collect directory info for unknown/excluded extensions without full indexing
+
+### Smart Suggestions
+- **Keep Largest**: Suggests keeping the larger file (default)
+- **Keep Shortest Name**: Suggests keeping the file with shortest filename (for merge operations)
+- **Cross-Volume Awareness**: Shows which drive each duplicate is on
+
+### User Interface
+- **Tabbed Interface**:
+  - **Drives Tab**: Manage and scan drives
+  - **File Types Tab**: Configure which extensions to index
+  - **Duplicates Tab**: Find and manage duplicates
+- **Real-Time Progress**: Shows progress during scanning with file counts
+- **Batch Operations**: Select multiple files for trash/delete operations
+- **Finder Integration**: Double-click directories to open in Finder
 
 ## Supported File Types
 
+### Images (Perceptual + Pixel Hash)
 - JPEG (`.jpg`, `.jpeg`)
 - GIF (`.gif`)
-- TIFF (`.tif`, `.tiff`)
+
+### Images (Pixel Hash)
 - PNG (`.png`)
+- TIFF (`.tif`, `.tiff`)
 - BMP (`.bmp`)
 - WebP (`.webp`)
-- RAW formats: Canon (`.cr2`, `.crw`, `.cr3`), Fuji (`.raf`), generic (`.raw`)
+- HEIC/HEIF (`.heic`, `.heif`)
+- RAW formats: Canon (`.cr2`, `.cr3`), Nikon (`.nef`), Sony (`.arw`), Fuji (`.raf`), and more
+
+### Other Media (Exact Hash)
+- Video: `.mp4`, `.mov`, `.avi`, `.mkv`, `.wmv`, `.flv`, `.webm`, etc.
+- Audio: `.mp3`, `.wav`, `.flac`, `.aac`, `.m4a`, `.ogg`, etc.
+- Documents: `.pdf`, `.doc`, `.docx`, `.xls`, `.xlsx`, `.ppt`, `.pptx`, etc.
+- Archives: `.zip`, `.rar`, `.7z`, `.tar`, `.gz`, etc.
 
 ## Installation
 
 ### Requirements
 
 - Python 3.9+
-- macOS (uses native Finder integration)
+- macOS (uses native Finder integration for trash)
 
 ### Setup
 
@@ -57,6 +92,7 @@ PyQt6>=6.6.0
 Pillow>=10.0.0
 numpy>=1.24.0
 rawpy>=0.19.0
+imagehash>=4.3.0
 ```
 
 ## Usage
@@ -69,97 +105,106 @@ python src/main.py
 
 ### Workflow
 
-1. **Select Directory**: Click "Browse" to choose a root directory to scan
-2. **Choose Mode**:
-   - **Intra-Directory**: Find duplicates within the same folder
-   - **Date Folder Merge**: For year folders like `2004/`, finds duplicates across folders with the same date prefix (e.g., `01-18` and `01-18 Grace`)
-3. **Scan**: Click "Scan for Duplicates" to begin the analysis
-4. **Review Results**: Duplicates are grouped and displayed with:
-   - File name, size, resolution, and path
-   - Suggested action (KEEP or DELETE)
-   - Target folder for merge mode (shown as `[→ FolderName]`)
-5. **Adjust Selections**: Check/uncheck files to customize which to keep
-6. **Take Action**:
-   - **Move Selected**: Moves checked files to a `_duplicates` folder (intra-directory mode)
-   - **Merge Folders**: Deletes duplicates and optionally removes empty source folders (merge mode)
-   - **Delete Selected**: Permanently deletes checked files
-   - **Export CSV**: Saves results to a CSV file
+#### 1. Scan Drives (Drives Tab)
+1. Connected drives appear in the drives list
+2. Click **"Scan Drive"** to index a drive
+3. Progress shows files scanned and hashes computed
+4. Scan can be paused/resumed if interrupted
 
-### Date Folder Merge Mode
+#### 2. Configure File Types (File Types Tab)
+1. Review which extensions are being indexed
+2. Move extensions between Include/Exclude/Unknown lists
+3. Click **"Collect Directory Info"** to find where unknown extensions are located
+4. Double-click any extension to see directories containing those files
+5. Click **"Save Changes"** to apply
 
-This mode is designed for photo libraries organized by date, where you might have:
+#### 3. Find Duplicates (Duplicates Tab)
+1. Select mode:
+   - **Within a source**: Find duplicates on one drive
+   - **Between two sources**: Find duplicates across two drives
+2. Select drive(s) from dropdown
+3. Click **"Find Duplicates"**
+4. Review results grouped by duplicate sets
+5. Check/uncheck files to customize selections
+6. Click **"Move Selected to Trash"** to remove duplicates
+
+### Database Location
+
+The SQLite database is stored at:
 ```
-2004/
-├── 01-18/           # Original folder with photos
-├── 01-18 Grace/     # Same day, different event name
-├── 03-22/
-└── 03-22 Birthday/
+~/.dedupe/dedupe.db
 ```
 
-The merge mode will:
-1. Find folders with the same date prefix (e.g., `01-18` matches `01-18 Grace`)
-2. Scan both folders for exact duplicates
-3. Keep the file with the **shortest filename** (typically the cleaner name)
-4. Mark other duplicates for deletion
-5. Offer to remove empty folders after merging
-
-### Context Menu
-
-Right-click on any file in the results to:
-- **Show in Finder**: Opens Finder with the file selected
-- **Open File**: Opens the file with the default application
+This contains all indexed file metadata and hashes. Delete this file to start fresh.
 
 ## How It Works
 
+### Scanning Process
+
+1. **Volume Detection**: Identifies drive by UUID for persistent tracking
+2. **File Discovery**: Walks filesystem, filtering by extension
+3. **Metadata Collection**: Stores file size, dates, dimensions (for images)
+4. **Hash Computation**: Multi-threaded hash computation based on file type:
+   - Images: Perceptual hash (pHash) + pixel MD5
+   - Other files: Full file MD5
+5. **Database Storage**: All data persisted to SQLite for fast future lookups
+
 ### Duplicate Detection
 
-The application uses MD5 hashing on file contents to find exact duplicates:
-
-1. Scans the selected directory recursively for supported image files
-2. Groups files by directory, then by extension type
-3. Computes MD5 hash for each file in parallel (using all CPU cores)
-4. Files with identical hashes are grouped as duplicates
-
-This approach:
-- Finds only true byte-for-byte duplicates (not visually similar images)
-- Is fast because it reads raw file bytes without image decoding
-- Works regardless of filename differences
-
-### Keep/Delete Suggestions
-
-For each duplicate group, the application suggests keeping the file with:
-1. **Largest file size** (primary criteria)
-2. **Highest resolution** (tiebreaker)
+1. **Hash Lookup**: Queries database for hash values that appear multiple times
+2. **Group Formation**: Files with identical hashes are grouped together
+3. **Cross-Volume Check**: Optionally filters to only show duplicates spanning multiple drives
+4. **Suggestion**: Determines which file to keep based on strategy (size or name length)
 
 ## Project Structure
 
 ```
 Dedupe/
 ├── src/
-│   ├── main.py                 # Application entry point
+│   ├── main.py                    # Application entry point
 │   ├── core/
-│   │   ├── scanner.py          # File discovery
-│   │   ├── deduplicator.py     # MD5 hash-based duplicate detection
-│   │   ├── analyzer.py         # File analysis utilities
-│   │   └── file_operations.py  # Move/delete operations
+│   │   ├── database.py            # SQLite database manager
+│   │   ├── file_scanner.py        # Multi-threaded file scanner
+│   │   ├── file_classifier.py     # File type and hash strategy
+│   │   ├── deduplicator.py        # Duplicate detection logic
+│   │   ├── volume_manager.py      # Drive/volume management
+│   │   ├── file_operations.py     # Move/delete/trash operations
+│   │   ├── scanner.py             # Legacy scanner (compatibility)
+│   │   └── analyzer.py            # File analysis utilities
 │   ├── models/
-│   │   ├── image_file.py       # Image metadata model
-│   │   └── duplicate_group.py  # Duplicate group model
+│   │   ├── image_file.py          # Image file model
+│   │   ├── scanned_file.py        # Generic scanned file model
+│   │   └── duplicate_group.py     # Duplicate group model
 │   ├── ui/
-│   │   ├── main_window.py      # Main application window
-│   │   ├── results_view.py     # Duplicate results display
-│   │   ├── image_preview.py    # Side-by-side image preview
-│   │   ├── progress_panel.py   # Progress indicator
-│   │   └── directory_selector.py
+│   │   ├── unified_window.py      # Main tabbed window
+│   │   ├── main_window.py         # Legacy main window
+│   │   ├── results_view.py        # Duplicate results display
+│   │   ├── image_preview.py       # Image preview panel
+│   │   ├── drive_manager.py       # Drive management UI
+│   │   ├── file_types_manager.py  # File types configuration UI
+│   │   ├── progress_panel.py      # Progress indicator
+│   │   └── directory_selector.py  # Directory picker
 │   └── utils/
-│       └── export.py           # CSV export
+│       ├── file_filters.py        # File filtering logic
+│       └── export.py              # CSV export
 ├── tests/
-│   ├── conftest.py             # Test fixtures
-│   ├── test_scanner.py
-│   └── sample_images/          # Test images
+│   ├── conftest.py                # Test fixtures
+│   └── test_*.py                  # Test files
 ├── requirements.txt
 └── README.md
 ```
+
+## Database Schema
+
+### Key Tables
+
+- **volumes**: Registered drives with UUID, name, mount point
+- **files**: Indexed files with metadata (path, size, dates, dimensions)
+- **hashes**: Computed hashes linked to files (supports multiple hash types per file)
+- **scan_sessions**: Scan history and progress tracking
+- **custom_extensions**: User-configured include/exclude extensions
+- **unknown_extensions**: Extensions encountered but not categorized
+- **extension_sample_paths**: Directory locations for unknown/excluded extensions
 
 ## Running Tests
 
