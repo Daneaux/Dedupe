@@ -24,6 +24,9 @@ from ..core.file_scanner import FileScanner, ScanStats
 from ..core.deduplicator import Deduplicator
 from ..models.duplicate_group import DuplicateGroup
 from .duplicate_group_viewer import DuplicateGroupViewerDialog
+from .duplicate_comparison_dialog import DuplicateComparisonDialog, DuplicateResolution
+from ..utils.file_mover import FileMover
+from ..utils.exif_extractor import ExifExtractor
 
 
 # ============================================================================
@@ -2278,6 +2281,19 @@ class SetOperationsTab(QWidget):
         self.trash_btn.setEnabled(False)
         action_row.addWidget(self.trash_btn)
 
+        # Move to A button (for difference mode)
+        self.move_to_a_btn = QPushButton("Move Selected to A")
+        self.move_to_a_btn.setStyleSheet(
+            "QPushButton { background-color: #1976d2; color: white; "
+            "padding: 8px 16px; font-weight: bold; }"
+        )
+        self.move_to_a_btn.setToolTip(
+            "Move selected files from B to A, organized by date (YYYY/MM-DD)"
+        )
+        self.move_to_a_btn.clicked.connect(self._on_move_to_a)
+        self.move_to_a_btn.setEnabled(False)
+        action_row.addWidget(self.move_to_a_btn)
+
         layout.addLayout(action_row)
 
     def _configure_tree_columns(self):
@@ -2685,6 +2701,8 @@ class SetOperationsTab(QWidget):
             f"{count} files selected ({self._format_size(total_size)})"
         )
         self.trash_btn.setEnabled(count > 0)
+        # Move to A only enabled in difference mode with selections
+        self.move_to_a_btn.setEnabled(count > 0 and not self._is_intersection_mode)
 
     def _trash_selected(self):
         """Move selected files to trash."""
@@ -2722,6 +2740,150 @@ class SetOperationsTab(QWidget):
             msg += f"\n\nFailed to move {len(failed)} files."
 
         QMessageBox.information(self, "Complete", msg)
+
+    def _get_selected_difference_files(self) -> List[Dict]:
+        """Get file info dictionaries for selected files in difference mode."""
+        selected_files = []
+        for file_info in self._results:
+            mount_point = file_info.get('mount_point', '')
+            rel_path = file_info.get('relative_path', '')
+            full_path = str(Path(mount_point) / rel_path)
+            if full_path in self._selected_paths:
+                selected_files.append(file_info)
+        return selected_files
+
+    def _on_move_to_a(self):
+        """Handle Move to A button click - move files from B to A with EXIF date organization."""
+        if self._is_intersection_mode:
+            QMessageBox.warning(
+                self, "Not Available",
+                "Move to A is only available in Difference mode."
+            )
+            return
+
+        selected_files = self._get_selected_difference_files()
+        if not selected_files:
+            QMessageBox.warning(
+                self, "No Selection",
+                "Please select files to move."
+            )
+            return
+
+        # Ask for destination root folder
+        dest_root = QFileDialog.getExistingDirectory(
+            self,
+            "Select Destination Root Folder (files will be organized by YYYY/MM-DD)",
+            ""
+        )
+
+        if not dest_root:
+            return
+
+        dest_root = Path(dest_root)
+        hash_type = self.hash_combo.currentData()
+
+        # Create file mover and progress dialog
+        file_mover = FileMover(self.db, ExifExtractor())
+
+        progress = QProgressDialog(
+            "Moving files...", "Cancel", 0, len(selected_files), self
+        )
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+
+        moved_count = 0
+        skipped_count = 0
+        trashed_count = 0
+        failed_paths = []
+
+        for i, file_info in enumerate(selected_files):
+            if progress.wasCanceled():
+                break
+
+            # Get source path
+            mount_point = file_info.get('mount_point', '')
+            rel_path = file_info.get('relative_path', '')
+            source_path = Path(mount_point) / rel_path
+
+            progress.setLabelText(f"Processing: {source_path.name}")
+            progress.setValue(i)
+
+            if not source_path.exists():
+                failed_paths.append(str(source_path))
+                continue
+
+            # Get destination path using EXIF dates
+            dest_path = file_mover.get_destination_path(source_path, dest_root)
+
+            # Check for duplicates in destination directory (flat only)
+            duplicate = file_mover.check_for_duplicate(source_path, dest_path.parent, hash_type)
+
+            if duplicate:
+                # Show comparison dialog
+                resolution = DuplicateComparisonDialog.get_resolution(
+                    source_path, duplicate, self
+                )
+
+                if resolution is None or resolution == DuplicateResolution.SKIP:
+                    skipped_count += 1
+                    continue
+                elif resolution == DuplicateResolution.TRASH_SOURCE:
+                    if file_mover.move_to_trash(source_path):
+                        trashed_count += 1
+                    else:
+                        failed_paths.append(str(source_path))
+                    continue
+                elif resolution == DuplicateResolution.REPLACE:
+                    # Move existing file to trash first
+                    if not file_mover.move_to_trash(duplicate):
+                        failed_paths.append(str(source_path))
+                        continue
+                    # Fall through to move
+                elif resolution == DuplicateResolution.KEEP_BOTH:
+                    # Generate unique name
+                    dest_path = file_mover.get_unique_name(dest_path)
+                    # Fall through to move
+
+            # Create destination directory if needed
+            try:
+                dest_path.parent.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                failed_paths.append(str(source_path))
+                continue
+
+            # Move the file
+            if file_mover.move_file(source_path, dest_path):
+                moved_count += 1
+                # Remove from selected paths
+                full_path = str(Path(mount_point) / rel_path)
+                self._selected_paths.discard(full_path)
+            else:
+                failed_paths.append(str(source_path))
+
+        progress.setValue(len(selected_files))
+
+        # Refresh results
+        self._execute_operation()
+
+        # Show summary
+        summary_parts = []
+        if moved_count > 0:
+            summary_parts.append(f"Moved {moved_count} files")
+        if trashed_count > 0:
+            summary_parts.append(f"Trashed {trashed_count} duplicates")
+        if skipped_count > 0:
+            summary_parts.append(f"Skipped {skipped_count} files")
+        if failed_paths:
+            summary_parts.append(f"Failed {len(failed_paths)} files")
+
+        msg = ", ".join(summary_parts) if summary_parts else "No files processed"
+
+        if failed_paths and len(failed_paths) <= 5:
+            msg += "\n\nFailed files:\n" + "\n".join(failed_paths)
+        elif failed_paths:
+            msg += f"\n\n{len(failed_paths)} files failed to move."
+
+        QMessageBox.information(self, "Move Complete", msg)
 
     def _format_size(self, size: int) -> str:
         """Format size in bytes to human readable."""

@@ -34,11 +34,27 @@ A macOS desktop application for finding and managing duplicate files across mult
 - **Keep Shortest Name**: Suggests keeping the file with shortest filename (for merge operations)
 - **Cross-Volume Awareness**: Shows which drive each duplicate is on
 
+### Set Operations
+- **Difference (B − A)**: Find files that exist in volume B but not in volume A
+- **Intersection (A ∩ B)**: Find files that exist in both volumes
+- **Hash-Based Comparison**: Uses exact_md5 or pixel_md5 for file matching
+- **Subfolder Filtering**: Optionally limit operations to specific subdirectories
+- **Move to A**: Move difference files to volume A, organized by EXIF date (YYYY/MM-DD)
+- **Smart Directory Reuse**: Reuses existing directories with date descriptions (e.g., "05-03 England wedding")
+
+### EXIF Date Organization
+- **Automatic Date Extraction**: Extracts DateTimeOriginal from EXIF metadata
+- **Fallback Support**: Uses DateTimeDigitized or file modification date if EXIF unavailable
+- **RAW Support**: Works with CR2, NEF, ARW, RAF, DNG and other RAW formats
+- **HEIC/HEIF Support**: Extracts dates from Apple's HEIC format
+
 ### User Interface
 - **Tabbed Interface**:
   - **Drives Tab**: Manage and scan drives
   - **File Types Tab**: Configure which extensions to index
   - **Duplicates Tab**: Find and manage duplicates
+  - **Set Operations Tab**: Compare volumes using set algebra (difference, intersection)
+- **Duplicate Group Viewer**: Double-click any duplicate group to see all images side-by-side for comparison
 - **Real-Time Progress**: Shows progress during scanning with file counts
 - **Batch Operations**: Select multiple files for trash/delete operations
 - **Finder Integration**: Double-click directories to open in Finder
@@ -93,6 +109,7 @@ Pillow>=10.0.0
 numpy>=1.24.0
 rawpy>=0.19.0
 imagehash>=4.3.0
+send2trash>=1.8.0
 ```
 
 ## Usage
@@ -125,8 +142,22 @@ python src/main.py
 2. Select drive(s) from dropdown
 3. Click **"Find Duplicates"**
 4. Review results grouped by duplicate sets
-5. Check/uncheck files to customize selections
-6. Click **"Move Selected to Trash"** to remove duplicates
+5. Double-click a duplicate group to see all images side-by-side
+6. Check/uncheck files to customize selections
+7. Click **"Move Selected to Trash"** to remove duplicates
+
+#### 4. Set Operations (Set Operations Tab)
+1. Select operation type:
+   - **Difference (B − A)**: Files in B not in A
+   - **Intersection (A ∩ B)**: Files in both
+2. Select Source A and Source B volumes
+3. Optionally filter to specific subfolders using **"Filter to Folder..."**
+4. Choose comparison method (File Hash or Pixel Hash)
+5. Click **"Execute Operation"**
+6. Review results and select files
+7. Options:
+   - **Move Selected to Trash**: Delete selected files
+   - **Move Selected to A**: Move files to A, organized by EXIF date (YYYY/MM-DD)
 
 ### Database Location
 
@@ -176,7 +207,9 @@ Dedupe/
 │   │   ├── scanned_file.py        # Generic scanned file model
 │   │   └── duplicate_group.py     # Duplicate group model
 │   ├── ui/
-│   │   ├── unified_window.py      # Main tabbed window
+│   │   ├── unified_window.py      # Main tabbed window (includes SetOperationsTab)
+│   │   ├── duplicate_group_viewer.py  # Side-by-side duplicate comparison popup
+│   │   ├── duplicate_comparison_dialog.py  # Source/destination duplicate resolution
 │   │   ├── main_window.py         # Legacy main window
 │   │   ├── results_view.py        # Duplicate results display
 │   │   ├── image_preview.py       # Image preview panel
@@ -185,6 +218,8 @@ Dedupe/
 │   │   ├── progress_panel.py      # Progress indicator
 │   │   └── directory_selector.py  # Directory picker
 │   └── utils/
+│       ├── exif_extractor.py      # EXIF date extraction from images
+│       ├── file_mover.py          # File moving with EXIF date organization
 │       ├── file_filters.py        # File filtering logic
 │       └── export.py              # CSV export
 ├── tests/
