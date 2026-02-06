@@ -13,9 +13,13 @@ A macOS desktop application for finding and managing duplicate files across mult
 
 ### Duplicate Detection
 - **Multiple Hash Types**:
-  - `pixel_md5`: MD5 of image pixel data (ignores EXIF metadata)
+  - `exact_md5`: MD5 of entire file (byte-for-byte match)
+  - `pixel_md5`: MD5 of decoded pixel data (ignores EXIF metadata)
   - `perceptual_phash`: Perceptual hash for finding visually similar images
-  - `exact_md5`: Full file MD5 for non-image files
+- **Format-Specific Hashing**:
+  - Lossy images (JPEG, GIF): `pixel_md5` + `perceptual_phash`
+  - Lossless/RAW images (PNG, TIFF, CR2, NEF, etc.): `exact_md5` + `pixel_md5`
+  - Non-images (video, audio, docs): `exact_md5` only
 - **Cross-Drive Detection**: Find duplicates that exist on different drives
 - **Within-Drive Detection**: Find duplicates within a single drive
 - **Extension-Aware**: Only compares files of the same type (JPG vs JPG, not JPG vs RAW)
@@ -61,19 +65,23 @@ A macOS desktop application for finding and managing duplicate files across mult
 
 ## Supported File Types
 
-### Images (Perceptual + Pixel Hash)
+### Lossy Images (Pixel + Perceptual Hash)
 - JPEG (`.jpg`, `.jpeg`)
 - GIF (`.gif`)
 
-### Images (Pixel Hash)
+These formats benefit from perceptual hashing since re-compression changes both bytes and pixels.
+
+### Lossless/RAW Images (Exact + Pixel Hash)
 - PNG (`.png`)
 - TIFF (`.tif`, `.tiff`)
 - BMP (`.bmp`)
 - WebP (`.webp`)
-- HEIC/HEIF (`.heic`, `.heif`)
-- RAW formats: Canon (`.cr2`, `.cr3`), Nikon (`.nef`), Sony (`.arw`), Fuji (`.raf`), and more
+- HEIC/HEIF (`.heic`, `.heif`, `.avif`)
+- RAW formats: Canon (`.cr2`, `.cr3`), Nikon (`.nef`), Sony (`.arw`), Fuji (`.raf`), Adobe (`.dng`), and more
 
-### Other Media (Exact Hash)
+These archival formats use exact byte matching (same file = same source) plus pixel matching (catches metadata-only changes).
+
+### Other Media (Exact Hash Only)
 - Video: `.mp4`, `.mov`, `.avi`, `.mkv`, `.wmv`, `.flv`, `.webm`, etc.
 - Audio: `.mp3`, `.wav`, `.flac`, `.aac`, `.m4a`, `.ogg`, etc.
 - Documents: `.pdf`, `.doc`, `.docx`, `.xls`, `.xlsx`, `.ppt`, `.pptx`, etc.
@@ -176,8 +184,9 @@ This contains all indexed file metadata and hashes. Delete this file to start fr
 2. **File Discovery**: Walks filesystem, filtering by extension
 3. **Metadata Collection**: Stores file size, dates, dimensions (for images)
 4. **Hash Computation**: Multi-threaded hash computation based on file type:
-   - Images: Perceptual hash (pHash) + pixel MD5
-   - Other files: Full file MD5
+   - Lossy images (JPEG, GIF): `pixel_md5` + `perceptual_phash`
+   - Lossless/RAW images: `exact_md5` + `pixel_md5`
+   - Non-images: `exact_md5` only
 5. **Database Storage**: All data persisted to SQLite for fast future lookups
 
 ### Duplicate Detection

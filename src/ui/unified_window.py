@@ -2206,8 +2206,9 @@ class SetOperationsTab(QWidget):
         hash_row.addWidget(hash_label)
 
         self.hash_combo = QComboBox()
-        self.hash_combo.addItem("File Hash (exact_md5)", "exact_md5")
-        self.hash_combo.addItem("Pixel Hash (pixel_md5)", "pixel_md5")
+        self.hash_combo.addItem("Exact File Match", "exact_md5")
+        self.hash_combo.addItem("Exact Pixel Match", "pixel_md5")
+        self.hash_combo.addItem("Perceptual Match (visually similar)", "perceptual_phash")
         hash_row.addWidget(self.hash_combo)
 
         options_layout.addLayout(hash_row)
@@ -2251,6 +2252,7 @@ class SetOperationsTab(QWidget):
         self.results_tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.results_tree.setAlternatingRowColors(True)
         self.results_tree.itemChanged.connect(self._on_item_changed)
+        self.results_tree.itemDoubleClicked.connect(self._on_tree_item_double_clicked)
 
         self._configure_tree_columns()
 
@@ -2482,87 +2484,13 @@ class SetOperationsTab(QWidget):
                         path_b: Optional[str], path_a: Optional[str],
                         hash_type: str) -> List[Dict]:
         """Get files in B that are NOT in A (set difference B - A)."""
-        with self.db.cursor() as cursor:
-            # Build the query for files in B whose hash is not in A
-            query = """
-                SELECT DISTINCT f.*, v.name as volume_name, v.mount_point
-                FROM files f
-                JOIN hashes h ON f.id = h.file_id
-                JOIN volumes v ON f.volume_id = v.id
-                WHERE f.volume_id = ? AND f.is_deleted = 0
-                  AND h.hash_type = ?
-            """
-            params = [vol_b_id, hash_type]
-
-            # Add path filter for B
-            if path_b:
-                query += " AND f.relative_path LIKE ?"
-                params.append(f"{path_b}/%")
-
-            # Exclude hashes that exist in A
-            subquery = """
-                SELECT h2.hash_value FROM hashes h2
-                JOIN files f2 ON h2.file_id = f2.id
-                WHERE f2.volume_id = ? AND f2.is_deleted = 0 AND h2.hash_type = ?
-            """
-            sub_params = [vol_a_id, hash_type]
-
-            if path_a:
-                subquery += " AND f2.relative_path LIKE ?"
-                sub_params.append(f"{path_a}/%")
-
-            query += f" AND h.hash_value NOT IN ({subquery})"
-            params.extend(sub_params)
-
-            query += " ORDER BY f.relative_path"
-
-            cursor.execute(query, params)
-            return [dict(row) for row in cursor.fetchall()]
+        return self.db.get_set_difference(vol_b_id, vol_a_id, hash_type, path_b, path_a)
 
     def _get_intersection(self, vol_a_id: int, vol_b_id: int,
                           path_a: Optional[str], path_b: Optional[str],
                           hash_type: str) -> List[Dict]:
-        """Get paired files that exist in BOTH A and B (set intersection).
-
-        Returns results with columns for both files:
-        - filename_a, path_a, size_a, type_a, volume_a_name, mount_a
-        - filename_b, path_b, size_b, type_b, volume_b_name, mount_b
-        """
-        with self.db.cursor() as cursor:
-            # Join files from both volumes on matching hash
-            query = """
-                SELECT
-                    ha.hash_value,
-                    fa.id as file_a_id, fa.filename as filename_a, fa.relative_path as path_a,
-                    fa.file_size_bytes as size_a, fa.file_type as type_a,
-                    va.name as volume_a_name, va.mount_point as mount_a,
-                    fb.id as file_b_id, fb.filename as filename_b, fb.relative_path as path_b,
-                    fb.file_size_bytes as size_b, fb.file_type as type_b,
-                    vb.name as volume_b_name, vb.mount_point as mount_b
-                FROM hashes ha
-                JOIN files fa ON ha.file_id = fa.id
-                JOIN volumes va ON fa.volume_id = va.id
-                JOIN hashes hb ON ha.hash_value = hb.hash_value AND ha.hash_type = hb.hash_type
-                JOIN files fb ON hb.file_id = fb.id
-                JOIN volumes vb ON fb.volume_id = vb.id
-                WHERE fa.volume_id = ? AND fb.volume_id = ?
-                  AND fa.is_deleted = 0 AND fb.is_deleted = 0
-                  AND ha.hash_type = ?
-            """
-            params = [vol_a_id, vol_b_id, hash_type]
-
-            if path_a:
-                query += " AND fa.relative_path LIKE ?"
-                params.append(f"{path_a}/%")
-
-            if path_b:
-                query += " AND fb.relative_path LIKE ?"
-                params.append(f"{path_b}/%")
-
-            query += " ORDER BY fa.relative_path"
-
-            cursor.execute(query, params)
-            return [dict(row) for row in cursor.fetchall()]
+        """Get paired files that exist in BOTH A and B (set intersection)."""
+        return self.db.get_set_intersection(vol_a_id, vol_b_id, hash_type, path_a, path_b)
 
     def _populate_results(self):
         """Populate the results tree with query results."""
@@ -2649,6 +2577,27 @@ class SetOperationsTab(QWidget):
             self._selected_paths.discard(path)
 
         self._update_selection_count()
+
+    def _on_tree_item_double_clicked(self, item: QTreeWidgetItem, column: int):
+        """Handle double-click to open directory in file manager."""
+        full_path = item.data(0, Qt.ItemDataRole.UserRole)
+
+        if not full_path:
+            return
+
+        # For intersection mode with path columns, use appropriate path
+        if self._is_intersection_mode:
+            extra_data = item.data(1, Qt.ItemDataRole.UserRole)
+            if isinstance(extra_data, dict):
+                # Column 6 is Path B, columns 4-5 are Volume A/Path A
+                if column == 6:
+                    full_path = extra_data.get('path_b', full_path)
+                elif column in (4, 5):
+                    full_path = extra_data.get('path_a', full_path)
+
+        if full_path:
+            directory = str(Path(full_path).parent)
+            open_directory_in_file_manager(directory)
 
     def _select_all(self):
         """Select all items."""

@@ -553,6 +553,112 @@ class DatabaseManager:
 
             return [(row[0], row[1]) for row in cursor.fetchall()]
 
+    def get_set_difference(
+        self,
+        vol_b_id: int,
+        vol_a_id: int,
+        hash_type: str,
+        path_b: Optional[str] = None,
+        path_a: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Get files in volume B that are NOT in volume A (set difference B - A).
+
+        Args:
+            vol_b_id: Volume B ID (files to check)
+            vol_a_id: Volume A ID (files to exclude)
+            hash_type: Hash type to compare (exact_md5, pixel_md5, perceptual_phash)
+            path_b: Optional relative path filter for volume B
+            path_a: Optional relative path filter for volume A
+
+        Returns:
+            List of file dictionaries from volume B with no matching hash in A
+        """
+        with self.cursor() as cursor:
+            query = """
+                SELECT DISTINCT f.*, v.name as volume_name, v.mount_point
+                FROM files f
+                JOIN hashes h ON f.id = h.file_id
+                JOIN volumes v ON f.volume_id = v.id
+                WHERE f.volume_id = ? AND f.is_deleted = 0 AND h.hash_type = ?
+            """
+            params = [vol_b_id, hash_type]
+
+            if path_b:
+                query += " AND f.relative_path LIKE ?"
+                params.append(f"{path_b}/%")
+
+            subquery = """
+                SELECT h2.hash_value FROM hashes h2
+                JOIN files f2 ON h2.file_id = f2.id
+                WHERE f2.volume_id = ? AND f2.is_deleted = 0 AND h2.hash_type = ?
+            """
+            sub_params = [vol_a_id, hash_type]
+
+            if path_a:
+                subquery += " AND f2.relative_path LIKE ?"
+                sub_params.append(f"{path_a}/%")
+
+            query += f" AND h.hash_value NOT IN ({subquery})"
+            params.extend(sub_params)
+            query += " ORDER BY f.relative_path"
+
+            cursor.execute(query, params)
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_set_intersection(
+        self,
+        vol_a_id: int,
+        vol_b_id: int,
+        hash_type: str,
+        path_a: Optional[str] = None,
+        path_b: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Get paired files that exist in BOTH volumes (set intersection A ∩ B).
+
+        Args:
+            vol_a_id: Volume A ID
+            vol_b_id: Volume B ID
+            hash_type: Hash type to compare (exact_md5, pixel_md5, perceptual_phash)
+            path_a: Optional relative path filter for volume A
+            path_b: Optional relative path filter for volume B
+
+        Returns:
+            List of dicts with paired file info (filename_a, path_a, filename_b, path_b, etc.)
+        """
+        with self.cursor() as cursor:
+            query = """
+                SELECT ha.hash_value,
+                    fa.id as file_a_id, fa.filename as filename_a, fa.relative_path as path_a,
+                    fa.file_size_bytes as size_a, fa.file_type as type_a,
+                    va.name as volume_a_name, va.mount_point as mount_a,
+                    fb.id as file_b_id, fb.filename as filename_b, fb.relative_path as path_b,
+                    fb.file_size_bytes as size_b, fb.file_type as type_b,
+                    vb.name as volume_b_name, vb.mount_point as mount_b
+                FROM hashes ha
+                JOIN files fa ON ha.file_id = fa.id
+                JOIN volumes va ON fa.volume_id = va.id
+                JOIN hashes hb ON ha.hash_value = hb.hash_value AND ha.hash_type = hb.hash_type
+                JOIN files fb ON hb.file_id = fb.id
+                JOIN volumes vb ON fb.volume_id = vb.id
+                WHERE fa.volume_id = ? AND fb.volume_id = ?
+                  AND fa.is_deleted = 0 AND fb.is_deleted = 0
+                  AND ha.hash_type = ?
+            """
+            params = [vol_a_id, vol_b_id, hash_type]
+
+            if path_a:
+                query += " AND fa.relative_path LIKE ?"
+                params.append(f"{path_a}/%")
+
+            if path_b:
+                query += " AND fb.relative_path LIKE ?"
+                params.append(f"{path_b}/%")
+
+            query += " ORDER BY fa.relative_path"
+
+            cursor.execute(query, params)
+            return [dict(row) for row in cursor.fetchall()]
+
     # ==================== Scan Session Operations ====================
 
     def start_scan_session(

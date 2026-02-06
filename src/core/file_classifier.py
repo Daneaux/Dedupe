@@ -137,7 +137,7 @@ class FileType:
 # Maps file type to (primary_hash, secondary_hash)
 # Secondary hash is optional, used for more precise matching
 HASH_STRATEGY: Dict[str, Tuple[str, Optional[str]]] = {
-    FileType.IMAGE: (HashType.PERCEPTUAL_PHASH, HashType.PIXEL_MD5),
+    FileType.IMAGE: (HashType.EXACT_MD5, HashType.PIXEL_MD5),  # Default for images (overridden per extension)
     FileType.VIDEO: (HashType.EXACT_MD5, None),
     FileType.AUDIO: (HashType.EXACT_MD5, None),
     FileType.DOCUMENT: (HashType.EXACT_MD5, None),
@@ -342,10 +342,10 @@ class FileClassifier:
 
         # For images, use extension-specific strategy
         if file_type == FileType.IMAGE:
-            if ext in PERCEPTUAL_IMAGE_EXTENSIONS:
-                return (HashType.PERCEPTUAL_PHASH, HashType.PIXEL_MD5)
-            else:
+            if ext in PERCEPTUAL_IMAGE_EXTENSIONS:  # jpg, jpeg, gif (lossy formats)
                 return (HashType.PIXEL_MD5, HashType.PERCEPTUAL_PHASH)
+            else:  # RAW and lossless formats - no perceptual hash
+                return (HashType.EXACT_MD5, HashType.PIXEL_MD5)
 
         return HASH_STRATEGY.get(file_type, (HashType.EXACT_MD5, None))
 
