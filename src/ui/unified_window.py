@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
     QFileDialog, QProgressDialog, QMessageBox, QSplitter,
     QGroupBox, QRadioButton, QButtonGroup, QComboBox, QTreeWidget,
     QTreeWidgetItem, QHeaderView, QAbstractItemView, QSizePolicy,
-    QDialog, QDialogButtonBox, QApplication
+    QDialog, QDialogButtonBox, QApplication, QTableWidget, QTableWidgetItem
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QThread
 from PyQt6.QtGui import QFont, QBrush, QColor, QCursor
@@ -430,11 +430,6 @@ class DrivesTab(QWidget):
         # Second button row
         button_row2 = QHBoxLayout()
 
-        self.remove_btn = QPushButton("Remove from Index")
-        self.remove_btn.clicked.connect(self._remove_drive)
-        self.remove_btn.setEnabled(False)
-        button_row2.addWidget(self.remove_btn)
-
         button_row2.addStretch()
 
         self.excluded_paths_btn = QPushButton("Excluded Paths...")
@@ -443,6 +438,121 @@ class DrivesTab(QWidget):
         button_row2.addWidget(self.excluded_paths_btn)
 
         layout.addLayout(button_row2)
+
+        # Indexed Volumes Section
+        indexed_header = QLabel("Indexed Volumes")
+        indexed_header_font = QFont()
+        indexed_header_font.setPointSize(14)
+        indexed_header_font.setBold(True)
+        indexed_header.setFont(indexed_header_font)
+        layout.addWidget(indexed_header)
+
+        indexed_subtitle = QLabel("Volumes with indexed files in the database (remove to rescan fresh)")
+        indexed_subtitle.setStyleSheet("color: #666; font-size: 12px;")
+        layout.addWidget(indexed_subtitle)
+
+        # Indexed volumes table
+        self.indexed_volumes_table = QTableWidget()
+        self.indexed_volumes_table.setColumnCount(6)
+        self.indexed_volumes_table.setHorizontalHeaderLabels([
+            "Volume ID", "Volume Name", "UUID", "Files Indexed", "Last Scan", "Actions"
+        ])
+        self.indexed_volumes_table.horizontalHeader().setStretchLastSection(True)
+        self.indexed_volumes_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.indexed_volumes_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+        self.indexed_volumes_table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers
+        )
+        self.indexed_volumes_table.setMaximumHeight(200)
+        layout.addWidget(self.indexed_volumes_table)
+
+        # Data Management Section
+        data_header = QLabel("Data Management")
+        data_header_font = QFont()
+        data_header_font.setPointSize(14)
+        data_header_font.setBold(True)
+        data_header.setFont(data_header_font)
+        layout.addWidget(data_header)
+
+        # Database location (clickable link)
+        db_path = self.db.db_path
+        db_location_layout = QHBoxLayout()
+        db_label = QLabel("Database location:")
+        db_location_layout.addWidget(db_label)
+
+        self.db_path_link = QLabel(f"<a href='file://{db_path.parent}'>{db_path}</a>")
+        self.db_path_link.setOpenExternalLinks(False)
+        self.db_path_link.linkActivated.connect(self._open_database_folder)
+        self.db_path_link.setStyleSheet("color: #1976d2;")
+        self.db_path_link.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        db_location_layout.addWidget(self.db_path_link)
+        db_location_layout.addStretch()
+        layout.addLayout(db_location_layout)
+
+        # Nuke all data button
+        nuke_layout = QHBoxLayout()
+        self.nuke_btn = QPushButton("🗑️ Delete All Data")
+        self.nuke_btn.setToolTip("Delete the entire database and start fresh")
+        self.nuke_btn.setStyleSheet("color: #c62828;")  # Red text for danger
+        self.nuke_btn.clicked.connect(self._nuke_all_data)
+        nuke_layout.addWidget(self.nuke_btn)
+        nuke_layout.addStretch()
+        layout.addLayout(nuke_layout)
+
+    def _open_database_folder(self, link: str):
+        """Open the folder containing the database file."""
+        db_folder = self.db.db_path.parent
+        if platform.system() == "Darwin":  # macOS
+            subprocess.run(["open", str(db_folder)])
+        elif platform.system() == "Windows":
+            subprocess.run(["explorer", str(db_folder)])
+        else:  # Linux
+            subprocess.run(["xdg-open", str(db_folder)])
+
+    def _nuke_all_data(self):
+        """Delete the entire database and start fresh."""
+        # Get total counts for the warning
+        volumes = self.db.get_all_volumes()
+        total_files = sum(v.get('file_count', 0) or 0 for v in volumes)
+        total_volumes = len(volumes)
+
+        reply = QMessageBox.warning(
+            self, "Delete All Data",
+            f"⚠️ WARNING: This will permanently delete ALL data!\n\n"
+            f"This includes:\n"
+            f"  • {total_volumes} indexed volume(s)\n"
+            f"  • {total_files:,} indexed file(s)\n"
+            f"  • All computed hashes\n"
+            f"  • All scan history\n"
+            f"  • All duplicate group data\n\n"
+            "This action cannot be undone!\n\n"
+            "Are you sure you want to delete everything?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No  # Default to No
+        )
+
+        if reply == QMessageBox.StandardButton.Yes:
+            # Double confirmation for destructive action
+            confirm = QMessageBox.question(
+                self, "Confirm Delete All",
+                "Are you ABSOLUTELY sure?\n\n"
+                "Type 'yes' mentally and click Yes to confirm.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+
+            if confirm == QMessageBox.StandardButton.Yes:
+                self.db.nuke_all_data()
+                self.refresh_drives()
+                QMessageBox.information(
+                    self, "Data Deleted",
+                    "All data has been deleted.\n\n"
+                    "The database is now empty. You can start scanning volumes again."
+                )
 
     def refresh_drives(self):
         """Refresh the list of available drives."""
@@ -473,6 +583,81 @@ class DrivesTab(QWidget):
             self.drive_list.addItem(item)
             self.drive_list.setItemWidget(item, widget)
 
+        # Refresh indexed volumes table
+        self._refresh_indexed_volumes()
+
+    def _refresh_indexed_volumes(self):
+        """Refresh the indexed volumes table."""
+        self.indexed_volumes_table.setRowCount(0)
+
+        # Use authoritative source for indexed volumes
+        volumes = self.db.get_indexed_volumes()
+
+        for vol in volumes:
+            file_count = vol.get('file_count', 0) or 0
+
+            row = self.indexed_volumes_table.rowCount()
+            self.indexed_volumes_table.insertRow(row)
+
+            volume_id = vol.get('id', 0)
+
+            # Volume ID
+            id_item = QTableWidgetItem(str(volume_id))
+            id_item.setData(Qt.ItemDataRole.UserRole, volume_id)
+            self.indexed_volumes_table.setItem(row, 0, id_item)
+
+            # Volume name
+            volume_name = vol.get('name', 'Unknown')
+            self.indexed_volumes_table.setItem(row, 1, QTableWidgetItem(volume_name))
+
+            # UUID (truncated for display)
+            uuid = vol.get('uuid', '')
+            uuid_display = uuid[:12] + "..." if len(uuid) > 15 else uuid
+            uuid_item = QTableWidgetItem(uuid_display)
+            uuid_item.setToolTip(uuid)  # Full UUID on hover
+            self.indexed_volumes_table.setItem(row, 2, uuid_item)
+
+            # Files indexed
+            self.indexed_volumes_table.setItem(row, 3, QTableWidgetItem(f"{file_count:,}"))
+
+            # Last scan timestamp
+            last_scan = vol.get('last_scan_at', '')
+            if last_scan:
+                try:
+                    dt = datetime.fromisoformat(last_scan)
+                    last_scan = dt.strftime("%Y-%m-%d %H:%M")
+                except (ValueError, TypeError):
+                    pass
+            self.indexed_volumes_table.setItem(row, 4, QTableWidgetItem(last_scan))
+
+            # Remove button - deletes ALL data for this volume
+            remove_btn = QPushButton("Remove")
+            remove_btn.setToolTip("Remove all indexed data for this volume (allows fresh rescan)")
+            remove_btn.setMaximumWidth(80)
+            remove_btn.clicked.connect(
+                lambda checked, vid=volume_id, vname=volume_name, fcount=file_count:
+                self._remove_indexed_volume(vid, vname, fcount)
+            )
+            self.indexed_volumes_table.setCellWidget(row, 5, remove_btn)
+
+    def _remove_indexed_volume(self, volume_id: int, volume_name: str, file_count: int):
+        """Remove all indexed data for a volume from the database."""
+        reply = QMessageBox.question(
+            self, "Remove Indexed Volume",
+            f"Remove '{volume_name}' from the database?\n\n"
+            f"This will delete:\n"
+            f"  • {file_count:,} indexed files\n"
+            f"  • All computed hashes\n"
+            f"  • All scan history for this volume\n\n"
+            "Your actual files will NOT be affected.\n"
+            "You can rescan the volume afterward.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+
+        if reply == QMessageBox.StandardButton.Yes:
+            self.db.delete_volume(volume_id)
+            self.refresh_drives()  # Refresh both drives list and indexed volumes table
+
     def _on_selection_changed(self):
         """Handle selection change."""
         selected = self.drive_list.selectedItems()
@@ -487,14 +672,9 @@ class DrivesTab(QWidget):
         self.excluded_paths_btn.setEnabled(has_selection)
 
         if has_selection:
-            db_info = self.db.get_volume_by_uuid(self.selected_volume.uuid)
-            file_count = (db_info.get('file_count') or 0) if db_info else 0
-            self.remove_btn.setEnabled(file_count > 0)
-
             has_paused = self._get_paused_session(self.selected_volume.uuid) is not None
             self.resume_btn.setEnabled(has_paused)
         else:
-            self.remove_btn.setEnabled(False)
             self.resume_btn.setEnabled(False)
 
     def _get_paused_session(self, volume_uuid: str) -> Optional[dict]:
@@ -592,26 +772,6 @@ class DrivesTab(QWidget):
 
         self._worker.start()
 
-    def _remove_drive(self):
-        """Remove drive from index."""
-        if not self.selected_volume:
-            return
-
-        db_info = self.db.get_volume_by_uuid(self.selected_volume.uuid)
-        if not db_info:
-            return
-
-        reply = QMessageBox.question(
-            self, "Remove Drive",
-            f"Remove '{self.selected_volume.name}' from the index?\n\n"
-            "This will delete all indexed data. Your files won't be affected.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-
-        if reply == QMessageBox.StandardButton.Yes:
-            self.db.delete_volume(db_info['id'])
-            self.refresh_drives()
-
     def _manage_excluded_paths(self):
         """Open dialog to manage excluded paths for the selected volume."""
         if not self.selected_volume:
@@ -642,11 +802,7 @@ class DrivesTab(QWidget):
 
     def get_indexed_volumes(self) -> List[dict]:
         """Get list of indexed volumes with file counts."""
-        result = []
-        for vol in self.db.get_all_volumes():
-            if (vol.get('file_count') or 0) > 0:
-                result.append(vol)
-        return result
+        return self.db.get_indexed_volumes()
 
 
 # ============================================================================
@@ -783,30 +939,31 @@ class ExtensionDirectoriesDialog(QDialog):
 
     def _load_directories(self):
         """Load directories from database."""
-        # Use sample paths for unknown/excluded extensions, or regular paths for included
-        if self.use_sample_paths:
+        # Always try files table first (works for indexed extensions)
+        directories = self.db.get_directories_by_extension(self.extension)
+        using_sample_paths = False
+
+        # If no results from files table, try sample paths as fallback
+        if not directories:
             directories = self.db.get_extension_sample_paths(self.extension)
-        else:
-            directories = self.db.get_directories_by_extension(self.extension)
+            if directories:
+                using_sample_paths = True
+                # Update title to show these are sample paths (not indexed)
+                self.setWindowTitle(f"Sample directories containing .{self.extension} files (not indexed)")
 
         total_files = 0
         total_dirs = len(directories)
 
         if not directories:
             # Show empty state message
-            if self.use_sample_paths:
-                empty_msg = (
-                    f"No directory information available for .{self.extension} files.\n\n"
-                    "This extension was encountered during scanning but directory\n"
-                    "information was not recorded. Re-scan your drives to collect\n"
-                    "directory information for this extension."
-                )
-            else:
-                empty_msg = (
-                    f"No indexed files with .{self.extension} extension found.\n\n"
-                    "This extension may not have been encountered during scanning,\n"
-                    "or all files with this extension have been deleted."
-                )
+            empty_msg = (
+                f"No directory information available for .{self.extension} files.\n\n"
+                "This could mean:\n"
+                "• The volume containing these files was removed from the index\n"
+                "• The files haven't been scanned yet\n"
+                "• Directory info wasn't recorded during scanning\n\n"
+                "Try rescanning your drives to collect this information."
+            )
             empty_item = QListWidgetItem(empty_msg)
             empty_item.setFlags(Qt.ItemFlag.NoItemFlags)
             empty_item.setForeground(QBrush(QColor("#666")))
@@ -1129,27 +1286,16 @@ class FileTypesTab(QWidget):
         ext = item.ext
         count = item.count
 
-        # Determine which list this item is from
-        sender = self.sender()
-        is_unknown = sender == self.unknown_list
-        is_excluded = sender == self.exclude_list
-
         if count == 0:
             QMessageBox.information(
                 self,
                 "No Files Found",
-                f"No indexed files with extension .{ext} were found.\n\n"
+                f"No files with extension .{ext} were found.\n\n"
                 "This extension may not have been encountered during scanning yet."
             )
             return
 
-        # For unknown/excluded extensions, show sample paths if available
-        if is_unknown or is_excluded:
-            dialog = ExtensionDirectoriesDialog(ext, self, use_sample_paths=True)
-            dialog.exec()
-            return
-
-        # Show directories dialog for included extensions
+        # Show directories dialog - it will try files table first, then sample paths
         dialog = ExtensionDirectoriesDialog(ext, self)
         dialog.exec()
 
@@ -1748,20 +1894,20 @@ class DuplicatesTab(QWidget):
         source1_index = 0
         source2_index = 0
 
-        volumes = self.db.get_all_volumes()
+        # Use authoritative source for indexed volumes
+        volumes = self.db.get_indexed_volumes()
 
         for i, vol in enumerate(volumes):
             file_count = vol.get('file_count') or 0
-            if file_count > 0:
-                name = f"{vol['name']} ({file_count:,} files)"
-                self.source1_combo.addItem(name, vol['id'])
-                self.source2_combo.addItem(name, vol['id'])
+            name = f"{vol['name']} ({file_count:,} files)"
+            self.source1_combo.addItem(name, vol['id'])
+            self.source2_combo.addItem(name, vol['id'])
 
-                # Restore selection if this was the previously selected volume
-                if vol['id'] == current_source1_id:
-                    source1_index = self.source1_combo.count() - 1
-                if vol['id'] == current_source2_id:
-                    source2_index = self.source2_combo.count() - 1
+            # Restore selection if this was the previously selected volume
+            if vol['id'] == current_source1_id:
+                source1_index = self.source1_combo.count() - 1
+            if vol['id'] == current_source2_id:
+                source2_index = self.source2_combo.count() - 1
 
         # Restore selections
         self.source1_combo.setCurrentIndex(source1_index)
@@ -2334,22 +2480,22 @@ class SetOperationsTab(QWidget):
         self.source_a_combo.addItem("-- Select Source A --", None)
         self.source_b_combo.addItem("-- Select Source B --", None)
 
-        volumes = self.db.get_all_volumes()
+        # Use authoritative source for indexed volumes
+        volumes = self.db.get_indexed_volumes()
 
         source_a_index = 0
         source_b_index = 0
 
         for i, vol in enumerate(volumes):
             file_count = vol.get('file_count') or 0
-            if file_count > 0:
-                name = f"{vol['name']} ({file_count:,} files)"
-                self.source_a_combo.addItem(name, vol['id'])
-                self.source_b_combo.addItem(name, vol['id'])
+            name = f"{vol['name']} ({file_count:,} files)"
+            self.source_a_combo.addItem(name, vol['id'])
+            self.source_b_combo.addItem(name, vol['id'])
 
-                if vol['id'] == current_a_id:
-                    source_a_index = self.source_a_combo.count() - 1
-                if vol['id'] == current_b_id:
-                    source_b_index = self.source_b_combo.count() - 1
+            if vol['id'] == current_a_id:
+                source_a_index = self.source_a_combo.count() - 1
+            if vol['id'] == current_b_id:
+                source_b_index = self.source_b_combo.count() - 1
 
         self.source_a_combo.setCurrentIndex(source_a_index)
         self.source_b_combo.setCurrentIndex(source_b_index)
@@ -2905,9 +3051,11 @@ class UnifiedWindow(QMainWindow):
 
     def _on_tab_changed(self, index: int):
         """Handle tab switch - refresh data as needed."""
-        # Duplicates tab is index 2
-        if index == 2:
+        # Refresh dropdowns when switching to tabs that show volume lists
+        if index == 2:  # Duplicates tab
             self.duplicates_tab.refresh_sources()
+        elif index == 3:  # Set Operations tab
+            self.set_operations_tab.refresh_sources()
 
     def _check_interrupted_scans(self):
         """Check for interrupted scans on startup.

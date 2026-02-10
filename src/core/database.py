@@ -313,6 +313,19 @@ class DatabaseManager:
             cursor.execute("SELECT * FROM volumes ORDER BY last_seen_at DESC")
             return [dict(row) for row in cursor.fetchall()]
 
+    def get_indexed_volumes(self) -> List[Dict[str, Any]]:
+        """Get volumes that have indexed files (file_count > 0).
+
+        This is the authoritative source for volume dropdowns in UI components.
+        """
+        with self.cursor() as cursor:
+            cursor.execute("""
+                SELECT * FROM volumes
+                WHERE file_count > 0
+                ORDER BY last_seen_at DESC
+            """)
+            return [dict(row) for row in cursor.fetchall()]
+
     def update_volume_scan_status(
         self,
         volume_id: int,
@@ -337,9 +350,50 @@ class DatabaseManager:
                 """, (status, now, volume_id))
 
     def delete_volume(self, volume_id: int):
-        """Delete a volume and all its files."""
+        """Delete a volume and all its associated data (files, hashes, scan sessions).
+
+        Files and hashes are deleted via CASCADE. Scan sessions must be deleted
+        explicitly since they don't have CASCADE defined in the schema.
+        Also cleans up orphaned unknown_extensions that no longer have sample paths
+        or indexed files.
+        """
         with self.cursor() as cursor:
+            # Delete scan sessions first (no CASCADE defined in schema)
+            cursor.execute("DELETE FROM scan_sessions WHERE volume_id = ?", (volume_id,))
+            # Delete volume (files, hashes, extension_sample_paths will CASCADE)
             cursor.execute("DELETE FROM volumes WHERE id = ?", (volume_id,))
+
+            # Clean up orphaned unknown_extensions that no longer have any sample paths
+            # or indexed files. This prevents stale counts from showing in the File Types tab.
+            cursor.execute("""
+                DELETE FROM unknown_extensions
+                WHERE extension NOT IN (
+                    SELECT DISTINCT extension FROM extension_sample_paths
+                ) AND extension NOT IN (
+                    SELECT DISTINCT extension FROM files WHERE is_deleted = 0
+                )
+            """)
+
+    def nuke_all_data(self):
+        """Delete ALL data from the database (volumes, files, hashes, scans, etc.).
+
+        This is a destructive operation that clears all tables while preserving
+        the schema. Use with extreme caution.
+        """
+        with self.cursor() as cursor:
+            # Delete in order to respect foreign key constraints
+            # (though CASCADE should handle most of this)
+            cursor.execute("DELETE FROM scan_checkpoints")
+            cursor.execute("DELETE FROM scan_sessions")
+            cursor.execute("DELETE FROM duplicate_group_files")
+            cursor.execute("DELETE FROM duplicate_groups")
+            cursor.execute("DELETE FROM hashes")
+            cursor.execute("DELETE FROM files")
+            cursor.execute("DELETE FROM volumes")
+            cursor.execute("DELETE FROM extension_sample_paths")
+            cursor.execute("DELETE FROM unknown_extensions")
+            # Preserve custom_extensions (user preferences)
+            # Preserve schema_version
 
     # ==================== File Operations ====================
 
@@ -587,19 +641,25 @@ class DatabaseManager:
                 query += " AND f.relative_path LIKE ?"
                 params.append(f"{path_b}/%")
 
-            subquery = """
-                SELECT h2.hash_value FROM hashes h2
-                JOIN files f2 ON h2.file_id = f2.id
-                WHERE f2.volume_id = ? AND f2.is_deleted = 0 AND h2.hash_type = ?
+            # Use NOT EXISTS instead of NOT IN for proper NULL handling.
+            # NOT IN with NULLs in the subquery causes unexpected behavior where
+            # no rows are excluded. NOT EXISTS handles NULLs correctly.
+            exists_query = """
+                AND NOT EXISTS (
+                    SELECT 1 FROM hashes h2
+                    JOIN files f2 ON h2.file_id = f2.id
+                    WHERE f2.volume_id = ? AND f2.is_deleted = 0
+                      AND h2.hash_type = ? AND h2.hash_value = h.hash_value
             """
-            sub_params = [vol_a_id, hash_type]
+            exists_params = [vol_a_id, hash_type]
 
             if path_a:
-                subquery += " AND f2.relative_path LIKE ?"
-                sub_params.append(f"{path_a}/%")
+                exists_query += " AND f2.relative_path LIKE ?"
+                exists_params.append(f"{path_a}/%")
 
-            query += f" AND h.hash_value NOT IN ({subquery})"
-            params.extend(sub_params)
+            exists_query += ")"
+            query += exists_query
+            params.extend(exists_params)
             query += " ORDER BY f.relative_path"
 
             cursor.execute(query, params)
@@ -734,6 +794,41 @@ class DatabaseManager:
             )
             row = cursor.fetchone()
             return dict(row) if row else None
+
+    def get_scan_sessions_for_volume(
+        self,
+        volume_id: int
+    ) -> List[Dict[str, Any]]:
+        """Get all scan sessions for a volume, ordered by most recent first."""
+        with self.cursor() as cursor:
+            cursor.execute("""
+                SELECT ss.*, v.name as volume_name, v.uuid as volume_uuid
+                FROM scan_sessions ss
+                JOIN volumes v ON ss.volume_id = v.id
+                WHERE ss.volume_id = ?
+                ORDER BY ss.started_at DESC
+            """, (volume_id,))
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_all_scan_sessions(self) -> List[Dict[str, Any]]:
+        """Get all scan sessions with volume info, ordered by most recent first."""
+        with self.cursor() as cursor:
+            cursor.execute("""
+                SELECT ss.*, v.name as volume_name, v.uuid as volume_uuid,
+                       v.mount_point as volume_mount_point
+                FROM scan_sessions ss
+                JOIN volumes v ON ss.volume_id = v.id
+                ORDER BY ss.started_at DESC
+            """)
+            return [dict(row) for row in cursor.fetchall()]
+
+    def delete_scan_session(self, session_id: int):
+        """Delete a scan session and its checkpoints (via CASCADE)."""
+        with self.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM scan_sessions WHERE id = ?",
+                (session_id,)
+            )
 
     # ==================== Duplicate Group Operations ====================
 
